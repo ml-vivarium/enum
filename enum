@@ -1,0 +1,100 @@
+enum(key, size, pairing_fn)
+enum(keys, sizes, pariring_fns)
+
+# cannot put map_fn in contructor bc keys might not be available b4 crossing?
+e.map()
+e.stack()
+
+e.value_at()
+# what about batching?
+
+# what is the internal structure for enabling composition?
+
+CompoundEnumeration([enum,mapper, stacker, enum]) 
+[{'op':'enum', ...}, {'op':'map'}, {'op':'stack'}]
+
+
+def enum_array(i_np, sizes_np):
+    sizes_ = np.concatenate([sizes_np[1:], np.array([1])])
+    # note, call to numpy to perform multiply.accumulate, can convert to jax scan
+    sizes_ = np.flip(onp.multiply.accumulate(np.flip(sizes_)))
+    return np.mod(np.floor_divide(np.reshape(i_np, (-1,1)), sizes_), sizes_np)
+
+
+print(enum_array(np.arange(30), np.array([2,3,5])))
+
+# enum design 
+# conceptually, sequence of (key, fn, size) triplets 
+# nested enums flatten out into a single such sequence 
+# repeated keys are not allowed
+# as a convenience, we facilitate mapping over the result
+# can do mapper as an arg of generator etc, or just punt entirely for now
+
+# should we think of enumerations as functional composition as well? 
+
+list(zip([1,2,3], [4,5,6], [8,9,10]))
+
+{'coords':[(fn, 3), (fn2, 5)],
+ 'dims':['i','j'],
+ 'data': 5
+}
+
+def build_enum(spec):
+    # flatten any specs in args
+    def unpack(x):
+        if type(x) == dict: # what is the right test?
+            return x['spec']
+        elif type(x) == tuple:
+            return x
+        else: 
+            print('error')   
+
+    spec_ = [unpack(x) for x in spec]
+    spec_.reverse()
+    keys, fns, sizes = zip(*spec_)
+    fns_dict = dict(zip(keys, fns))
+    sizes_ = np.array(sizes)
+    def coordinates_fn(i_np):
+        coordinates = enum_array(i_np, sizes_)
+        coordinates_ = {k:coordinates[:,i]  for i, k in enumerate(keys)}
+        coordinates_['root'] = i_np
+        return coordinates_
+
+    def values_fn(coords_dict):
+        return {k: fns_dict[k](coords_dict[k]) for k in keys}    
+
+    return {
+        'coordinates_fn': coordinates_fn,
+        'values_fn': values_fn
+        }    
+
+def value_at(enum, i_np):
+    coordinates = enum['coordinates_fn'](i_np)
+    values = enum['values_fn'](coordinates)
+    return {'coordinates':coordinates, 'values':values}        
+
+cf = build_enum([('i', lambda x: x+1, 2), ('j', lambda x: x+2, 3), ('k', lambda x: x+3, 5)])
+cf['coordinates_fn'](np.arange(30))
+cf['values_fn'](cf['coordinates_fn'](np.arange(30)))
+
+value_at(cf, np.arange(30))
+OrderedDict({'i':(lambda x: x+1, 2), 'j':(lambda x: x+2, 3), 'k':(lambda x: x+3, 5)})
+[[enum, enum, enum], ['k1','k2','k3'], {}]
+enum(i=(f, 3))
+
+# input
+{
+    'enum': [(k1, s)],
+    'canonicalization':{k1: f},
+    'paring':{k1:f},
+    'map': {k: f}
+}
+
+e1++e2++e3
+
+((e1++e1).map('k', f, ['init', 'bitcode'])++e3).map('k2', f2, ['k'], dim=['k0'])
+enum(['k1','k3'],[5,6],[f,f])
+
+e1.outer(e2).map(xx).stack().outer(e3)
+
+e.stack('dim').map()
