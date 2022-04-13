@@ -3,7 +3,6 @@ from typing import Any
 import jax.numpy as np
 import numpy as onp
 from jax import lax, ops, jit, random, vmap
-from jax.ops import index, index_add, index_update
 from functools import partial
 
 def integer_digits_fn(base, n):
@@ -34,6 +33,10 @@ def iterations_2(step_fn, init, steps):
         return state_,state_
     # add bit to join the init onto the stacked state    
     return lax.scan(_step_fn, init, None, steps)  
+
+
+
+
 
 def evolve_fn(step_fn, bitcode_fn, state_fn):
     def evolve(rule_number, state_number, steps):
