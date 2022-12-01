@@ -32,8 +32,6 @@ def iterations_4(step_fn, init, steps):
         return state_,state_
     # add bit to join the init onto the stacked state    
     _, evolution = lax.scan(_step_fn, init, None, steps)
-    print(evolution)
-    print(np.expand_dims(init, 0))
     evolution = np.concatenate([np.expand_dims(init, 0), evolution])
     return evolution
 
