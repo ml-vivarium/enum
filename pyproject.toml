@@ -4,9 +4,12 @@ version = "0.1.0"
 description = "JAX experiments for Wolfram/NKS-style cellular automata"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-  "jax[cuda12]>=0.4.30; platform_system == 'Linux'",
+  "numpy<2; platform_system == 'Linux'",
+  "jax[cuda12-pip]==0.4.23; platform_system == 'Linux'",
   "jax>=0.4.30; platform_system != 'Linux'",
+  "torch>=2.3",
 ]
 
 [tool.uv]
 package = false
+find-links = ["https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"]

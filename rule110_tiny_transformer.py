@@ -1,0 +1,664 @@
+import argparse
+import math
+import os
+import struct
+import time
+import zlib
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def rule_table_by_code(rule):
+    return torch.tensor([(rule >> code) & 1 for code in range(8)], dtype=torch.long)
+
+
+def eca_step(state, rule_table):
+    """One wrapped elementary CA step for a batch of binary 1D states."""
+    left = torch.roll(state, shifts=1, dims=-1)
+    center = state
+    right = torch.roll(state, shifts=-1, dims=-1)
+    code = left * 4 + center * 2 + right
+    table = rule_table.to(device=state.device)
+    return table[code]
+
+
+def eca_history(initial_state, frames, rule_table):
+    """Return frames consecutive states, including the initial state."""
+    states = [initial_state]
+    state = initial_state
+    for _ in range(frames - 1):
+        state = eca_step(state, rule_table)
+        states.append(state)
+    return torch.stack(states, dim=1)
+
+
+def make_lm_batch(batch_size, width, frames, direction, rule_table, device):
+    initial = torch.randint(0, 2, (batch_size, width), device=device)
+    history = eca_history(initial, frames, rule_table)
+    if direction == "reverse":
+        history = torch.flip(history, dims=(1,))
+    seq = history.reshape(batch_size, frames * width)
+    x = seq[:, :-1]
+    y = seq[:, 1:]
+    target_positions = torch.arange(1, frames * width, device=device)
+    loss_mask = target_positions >= width
+    return x, y, loss_mask.expand(batch_size, -1)
+
+
+def make_transition_batch(batch_size, width, rule_table, device):
+    x = torch.randint(0, 2, (batch_size, width), device=device)
+    y = eca_step(x, rule_table)
+    return x, y, None
+
+
+def write_rgb_png(path, pixels):
+    height = len(pixels)
+    width = len(pixels[0])
+    raw_rows = []
+    for row in pixels:
+        raw_rows.append(b"\x00" + bytes(channel for pixel in row for channel in pixel))
+    raw = b"".join(raw_rows)
+
+    def chunk(kind, data):
+        payload = kind + data
+        checksum = zlib.crc32(payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", checksum)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(
+        b"IHDR",
+        struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0),
+    )
+    png += chunk(b"IDAT", zlib.compress(raw))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def draw_line(pixels, x0, y0, x1, y1, color):
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    error = dx + dy
+    x = x0
+    y = y0
+    while True:
+        if 0 <= y < len(pixels) and 0 <= x < len(pixels[0]):
+            pixels[y][x] = color
+        if x == x1 and y == y1:
+            break
+        error2 = 2 * error
+        if error2 >= dy:
+            error += dy
+            x += sx
+        if error2 <= dx:
+            error += dx
+            y += sy
+
+
+def render_loss_curve_png(path, curves, width=1000, height=620):
+    bg = (255, 255, 255)
+    axis = (38, 39, 40)
+    grid = (224, 224, 224)
+    colors = {
+        30: (44, 112, 179),
+        110: (219, 84, 59),
+    }
+    pixels = [[bg for _ in range(width)] for _ in range(height)]
+    left = 70
+    right = 40
+    top = 35
+    bottom = 70
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+
+    all_points = [point for points in curves.values() for point in points]
+    max_step = max(step for step, _ in all_points)
+    min_loss = min(loss for _, loss in all_points)
+    max_loss = max(loss for _, loss in all_points)
+    min_loss = min(0.0, min_loss)
+    max_loss = max(math.log(2), max_loss)
+    pad = (max_loss - min_loss) * 0.08
+    min_loss -= pad
+    max_loss += pad
+
+    for i in range(6):
+        y = top + round(plot_h * i / 5)
+        draw_line(pixels, left, y, width - right, y, grid)
+    for i in range(6):
+        x = left + round(plot_w * i / 5)
+        draw_line(pixels, x, top, x, height - bottom, grid)
+    draw_line(pixels, left, top, left, height - bottom, axis)
+    draw_line(pixels, left, height - bottom, width - right, height - bottom, axis)
+
+    def project(step, loss):
+        x = left + round((step / max_step) * plot_w)
+        y = top + round((1.0 - (loss - min_loss) / (max_loss - min_loss)) * plot_h)
+        return x, y
+
+    for rule, points in curves.items():
+        color = colors.get(rule, (30, 30, 30))
+        previous = None
+        for step, loss in points:
+            current = project(step, loss)
+            if previous is not None:
+                draw_line(pixels, previous[0], previous[1], current[0], current[1], color)
+                draw_line(pixels, previous[0], previous[1] + 1, current[0], current[1] + 1, color)
+            previous = current
+        legend_x = width - right - 180
+        legend_y = top + 25 + 30 * list(curves.keys()).index(rule)
+        draw_line(pixels, legend_x, legend_y, legend_x + 45, legend_y, color)
+
+    write_rgb_png(path, pixels)
+
+
+def expand_grid(grid, scale, on_color, off_color):
+    pixels = []
+    for row in grid.tolist():
+        expanded_row = []
+        for value in row:
+            color = on_color if value else off_color
+            expanded_row.extend([color] * scale)
+        for _ in range(scale):
+            pixels.append(list(expanded_row))
+    return pixels
+
+
+def render_reconstruction_png(path, true_history, reconstructed_history, scale):
+    true_history = true_history.cpu().to(torch.long)
+    reconstructed_history = reconstructed_history.cpu().to(torch.long)
+    errors = true_history != reconstructed_history
+
+    off = (245, 245, 242)
+    on = (24, 26, 27)
+    ok = (232, 232, 226)
+    err = (218, 55, 50)
+    gap = [[(255, 255, 255)] * (true_history.shape[1] * scale) for _ in range(scale)]
+
+    true_panel = expand_grid(true_history, scale, on, off)
+    reconstructed_panel = expand_grid(reconstructed_history, scale, on, off)
+    error_panel = expand_grid(errors.to(torch.long), scale, err, ok)
+    pixels = true_panel + gap + reconstructed_panel + gap + error_panel
+    write_rgb_png(path, pixels)
+
+
+@torch.no_grad()
+def reconstruct_reverse(model, history, device):
+    """Generate a reversed history from the final row, then return forward-time rows."""
+    model.eval()
+    reversed_history = torch.flip(history, dims=(1,))
+    generated = reversed_history[:, 0].reshape(history.shape[0], history.shape[2])
+    total_tokens = history.shape[1] * history.shape[2]
+    while generated.shape[1] < total_tokens:
+        logits, _ = model(generated)
+        next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+    generated_reversed = generated.reshape(history.shape[0], history.shape[1], history.shape[2])
+    return torch.flip(generated_reversed, dims=(1,)).to(device)
+
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model,
+            n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, causal_mask):
+        h = self.ln1(x)
+        attn_out, _ = self.attn(h, h, h, attn_mask=causal_mask, need_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model,
+            n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        h = self.ln1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class RowMaskedBlock(nn.Module):
+    def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
+        self.lnq = nn.LayerNorm(d_model)
+        self.lnkv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model,
+            n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, query, context, attn_mask):
+        hq = self.lnq(query)
+        hkv = self.lnkv(context)
+        attn_out, _ = self.attn(hq, hkv, hkv, attn_mask=attn_mask, need_weights=False)
+        query = query + attn_out
+        query = query + self.mlp(self.ln2(query))
+        return query
+
+
+class TinyGPT(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        context_len,
+        d_model,
+        n_heads,
+        n_layers,
+        dropout,
+        width=None,
+        frames=None,
+        position_encoding="grid",
+    ):
+        super().__init__()
+        if position_encoding not in {"grid", "sequential", "both"}:
+            raise ValueError("position_encoding must be grid, sequential, or both")
+        if position_encoding in {"grid", "both"} and (width is None or frames is None):
+            raise ValueError("grid position encoding requires width and frames")
+
+        self.width = width
+        self.frames = frames
+        self.position_encoding = position_encoding
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        if position_encoding in {"sequential", "both"}:
+            self.pos_emb = nn.Embedding(context_len, d_model)
+        if position_encoding in {"grid", "both"}:
+            self.frame_emb = nn.Embedding(frames, d_model)
+            self.cell_emb = nn.Embedding(width, d_model)
+            self.target_frame_emb = nn.Embedding(frames, d_model)
+            self.target_cell_emb = nn.Embedding(width, d_model)
+        self.blocks = nn.ModuleList(
+            [Block(d_model, n_heads, dropout) for _ in range(n_layers)]
+        )
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, idx, targets=None, loss_mask=None):
+        _, seq_len = idx.shape
+        positions = torch.arange(seq_len, device=idx.device)
+        x = self.token_emb(idx)
+        if self.position_encoding in {"sequential", "both"}:
+            x = x + self.pos_emb(positions)[None, :, :]
+        if self.position_encoding in {"grid", "both"}:
+            frame_positions = torch.div(positions, self.width, rounding_mode="floor")
+            cell_positions = positions % self.width
+            target_positions = positions + 1
+            target_frame_positions = torch.div(
+                target_positions,
+                self.width,
+                rounding_mode="floor",
+            )
+            target_cell_positions = target_positions % self.width
+            x = x + self.frame_emb(frame_positions)[None, :, :]
+            x = x + self.cell_emb(cell_positions)[None, :, :]
+            x = x + self.target_frame_emb(target_frame_positions)[None, :, :]
+            x = x + self.target_cell_emb(target_cell_positions)[None, :, :]
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=idx.device),
+            diagonal=1,
+        )
+
+        for block in self.blocks:
+            x = block(x, causal_mask)
+
+        logits = self.head(self.ln(x))
+        loss = None
+        if targets is not None:
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="none",
+            )
+            if loss_mask is not None:
+                token_loss = token_loss.reshape_as(targets)
+                loss = (token_loss * loss_mask).sum() / loss_mask.sum()
+            else:
+                loss = token_loss.mean()
+        return logits, loss
+
+
+class TinyRowMaskedGPT(nn.Module):
+    def __init__(self, vocab_size, context_len, d_model, n_heads, n_layers, dropout, width, frames):
+        super().__init__()
+        self.width = width
+        self.frames = frames
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.source_frame_emb = nn.Embedding(frames, d_model)
+        self.source_cell_emb = nn.Embedding(width, d_model)
+        self.target_frame_emb = nn.Embedding(frames, d_model)
+        self.target_cell_emb = nn.Embedding(width, d_model)
+        self.blocks = nn.ModuleList(
+            [RowMaskedBlock(d_model, n_heads, dropout) for _ in range(n_layers)]
+        )
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, idx, targets=None, loss_mask=None):
+        _, seq_len = idx.shape
+        source_positions = torch.arange(seq_len, device=idx.device)
+        target_positions = source_positions + 1
+
+        source_frames = torch.div(source_positions, self.width, rounding_mode="floor")
+        source_cells = source_positions % self.width
+        target_frames = torch.div(target_positions, self.width, rounding_mode="floor")
+        target_cells = target_positions % self.width
+
+        context = self.token_emb(idx)
+        context = context + self.source_frame_emb(source_frames)[None, :, :]
+        context = context + self.source_cell_emb(source_cells)[None, :, :]
+
+        query = self.target_frame_emb(target_frames)[None, :, :]
+        query = query + self.target_cell_emb(target_cells)[None, :, :]
+        query = query.expand(idx.shape[0], -1, -1)
+
+        allow_prior_rows = source_frames[None, :] < target_frames[:, None]
+        allow_initial_row = (target_frames[:, None] == 0) & (
+            source_positions[None, :] < target_positions[:, None]
+        )
+        attn_mask = ~(allow_prior_rows | allow_initial_row)
+
+        for block in self.blocks:
+            query = block(query, context, attn_mask)
+
+        logits = self.head(self.ln(query))
+        loss = None
+        if targets is not None:
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="none",
+            )
+            if loss_mask is not None:
+                token_loss = token_loss.reshape_as(targets)
+                loss = (token_loss * loss_mask).sum() / loss_mask.sum()
+            else:
+                loss = token_loss.mean()
+        return logits, loss
+
+
+class TinyTransitionTransformer(nn.Module):
+    def __init__(self, vocab_size, width, d_model, n_heads, n_layers, dropout):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(width, d_model)
+        self.blocks = nn.ModuleList(
+            [EncoderBlock(d_model, n_heads, dropout) for _ in range(n_layers)]
+        )
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, idx, targets=None, loss_mask=None):
+        _, width = idx.shape
+        positions = torch.arange(width, device=idx.device)
+        x = self.token_emb(idx) + self.pos_emb(positions)[None, :, :]
+        for block in self.blocks:
+            x = block(x)
+        logits = self.head(self.ln(x))
+        loss = None
+        if targets is not None:
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="none",
+            )
+            if loss_mask is not None:
+                token_loss = token_loss.reshape_as(targets)
+                loss = (token_loss * loss_mask).sum() / loss_mask.sum()
+            else:
+                loss = token_loss.mean()
+        return logits, loss
+
+
+@torch.no_grad()
+def estimate_loss(model, make_batch, batch_size, eval_batches, device):
+    model.eval()
+    losses = []
+    accuracies = []
+    for _ in range(eval_batches):
+        x, y, loss_mask = make_batch(batch_size, device)
+        logits, loss = model(x, y, loss_mask)
+        pred = logits.argmax(dim=-1)
+        losses.append(loss.item())
+        correct = (pred == y).float()
+        if loss_mask is not None:
+            correct = correct * loss_mask
+            accuracies.append((correct.sum() / loss_mask.sum()).item())
+        else:
+            accuracies.append(correct.mean().item())
+    model.train()
+    return sum(losses) / len(losses), sum(accuracies) / len(accuracies)
+
+
+def parse_rule_list(value):
+    return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def build_experiment(args, rule, device):
+    rule_table = rule_table_by_code(rule)
+    if args.task == "lm":
+        context_len = args.width * args.frames - 1
+        make_batch = lambda batch_size, device: make_lm_batch(
+            batch_size,
+            args.width,
+            args.frames,
+            args.lm_direction,
+            rule_table,
+            device,
+        )
+        if args.mask_row_prefix:
+            if args.position_encoding != "grid":
+                raise ValueError("--mask-row-prefix currently requires --position-encoding grid")
+            model = TinyRowMaskedGPT(
+                vocab_size=2,
+                context_len=context_len,
+                d_model=args.d_model,
+                n_heads=args.heads,
+                n_layers=args.layers,
+                dropout=args.dropout,
+                width=args.width,
+                frames=args.frames,
+            ).to(device)
+        else:
+            model = TinyGPT(
+                vocab_size=2,
+                context_len=context_len,
+                d_model=args.d_model,
+                n_heads=args.heads,
+                n_layers=args.layers,
+                dropout=args.dropout,
+                width=args.width,
+                frames=args.frames,
+                position_encoding=args.position_encoding,
+            ).to(device)
+    else:
+        context_len = args.width
+        make_batch = lambda batch_size, device: make_transition_batch(
+            batch_size,
+            args.width,
+            rule_table,
+            device,
+        )
+        model = TinyTransitionTransformer(
+            vocab_size=2,
+            width=args.width,
+            d_model=args.d_model,
+            n_heads=args.heads,
+            n_layers=args.layers,
+            dropout=args.dropout,
+        ).to(device)
+    return rule_table, context_len, make_batch, model
+
+
+def train_experiment(args, rule, device):
+    rule_table, context_len, make_batch, model = build_experiment(args, rule, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    parameter_count = sum(p.numel() for p in model.parameters())
+    chance_loss = math.log(2)
+    print(
+        f"rule={rule} task={args.task} lm_direction={args.lm_direction} "
+        f"mask_row_prefix={args.mask_row_prefix} "
+        f"device={device} parameters={parameter_count:,} context_len={context_len}",
+        flush=True,
+    )
+    print(f"chance_loss={chance_loss:.4f}", flush=True)
+
+    curve = []
+    start = time.time()
+    model.train()
+    for step in range(1, args.steps + 1):
+        x, y, loss_mask = make_batch(args.batch_size, device)
+        _, loss = model(x, y, loss_mask)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step == 1 or step % args.eval_every == 0 or step == args.steps:
+            eval_loss, eval_acc = estimate_loss(
+                model,
+                make_batch,
+                args.batch_size,
+                args.eval_batches,
+                device,
+            )
+            curve.append((step, eval_loss))
+            elapsed = time.time() - start
+            print(
+                f"rule={rule} "
+                f"step={step:5d} "
+                f"train_loss={loss.item():.4f} "
+                f"eval_loss={eval_loss:.4f} "
+                f"eval_acc={eval_acc:.3f} "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+    return rule_table, make_batch, model, curve
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=("lm", "transition"), default="lm")
+    parser.add_argument("--lm-direction", choices=("forward", "reverse"), default="forward")
+    parser.add_argument("--mask-row-prefix", action="store_true")
+    parser.add_argument("--rule", type=int, default=110)
+    parser.add_argument("--compare-rules", default=None)
+    parser.add_argument(
+        "--position-encoding",
+        choices=("grid", "sequential", "both"),
+        default="grid",
+    )
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--frames", type=int, default=16)
+    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--eval-batches", type=int, default=8)
+    parser.add_argument("--eval-every", type=int, default=100)
+    parser.add_argument("--reconstruction-image", default=None)
+    parser.add_argument("--reconstruction-samples", type=int, default=1)
+    parser.add_argument("--loss-curve-image", default=None)
+    parser.add_argument("--image-scale", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.compare_rules is not None:
+        curves = {}
+        for rule in parse_rule_list(args.compare_rules):
+            torch.manual_seed(args.seed)
+            _, _, _, curve = train_experiment(args, rule, device)
+            curves[rule] = curve
+        if args.loss_curve_image is not None:
+            render_loss_curve_png(args.loss_curve_image, curves)
+            print(f"wrote_loss_curve_image={args.loss_curve_image}", flush=True)
+        return
+
+    torch.manual_seed(args.seed)
+    rule_table, make_batch, model, curve = train_experiment(args, args.rule, device)
+    if args.loss_curve_image is not None:
+        render_loss_curve_png(args.loss_curve_image, {args.rule: curve})
+        print(f"wrote_loss_curve_image={args.loss_curve_image}", flush=True)
+
+    if args.reconstruction_image is not None:
+        if args.task != "lm" or args.lm_direction != "reverse":
+            raise ValueError("reconstruction images currently require --task lm --lm-direction reverse")
+        root, ext = os.path.splitext(args.reconstruction_image)
+        if not ext:
+            ext = ".png"
+        for sample_idx in range(args.reconstruction_samples):
+            initial = torch.randint(0, 2, (1, args.width), device=device)
+            true_history = eca_history(initial, args.frames, rule_table)
+            reconstructed_history = reconstruct_reverse(model, true_history, device)
+            path = (
+                args.reconstruction_image
+                if args.reconstruction_samples == 1
+                else f"{root}_{sample_idx + 1:02d}{ext}"
+            )
+            render_reconstruction_png(
+                path,
+                true_history[0],
+                reconstructed_history[0],
+                args.image_scale,
+            )
+            cell_acc = (true_history == reconstructed_history).float().mean().item()
+            exact_frames = (
+                (true_history == reconstructed_history).all(dim=-1).float().mean().item()
+            )
+            print(
+                f"wrote_reconstruction_image={path} "
+                f"sample_cell_acc={cell_acc:.3f} "
+                f"sample_exact_frame_rate={exact_frames:.3f}",
+                flush=True,
+            )
+
+
+if __name__ == "__main__":
+    main()
