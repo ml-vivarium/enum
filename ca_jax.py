@@ -146,8 +146,11 @@ def encode_wrapped_convolution(state, kernel):
     spatial = _dimension_chars(state.ndim)
     lhs_spec = "N" + spatial + "C"
     rhs_spec = spatial + "IO"
-    lhs = padded[jnp.newaxis, ..., jnp.newaxis]
-    rhs = kernel[..., jnp.newaxis, jnp.newaxis]
+    # CUDA cuDNN does not support the s32 convolution we want for CA encodings.
+    # CA neighborhood sums are small in the practical Wolfram-style cases we run,
+    # so float32 accumulation is exact and can be cast back before table lookup.
+    lhs = padded[jnp.newaxis, ..., jnp.newaxis].astype(jnp.float32)
+    rhs = kernel[..., jnp.newaxis, jnp.newaxis].astype(jnp.float32)
     result = lax.conv_general_dilated(
         lhs,
         rhs,
@@ -155,7 +158,7 @@ def encode_wrapped_convolution(state, kernel):
         padding="VALID",
         dimension_numbers=(lhs_spec, rhs_spec, lhs_spec),
     )
-    return result[0, ..., 0].astype(jnp.int32)
+    return jnp.rint(result[0, ..., 0]).astype(jnp.int32)
 
 
 def step_shift_accumulate(state, table, offsets, weights):
