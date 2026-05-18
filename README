@@ -1,1 +1,283 @@
+# enum
 
+JAX experiments for Wolfram/NKS-style cellular automata.
+
+The core implementation is in `ca_jax.py`. The guiding algorithm is:
+
+```text
+state -> neighborhood integer code -> Wolfram-ordered lookup table -> next state
+```
+
+For 1D rules this is implemented with shift-and-accumulate over rolled arrays. For 2D and 3D rules this is implemented with wrapped padding plus `jax.lax.conv_general_dilated`, where the convolution kernel contains the integer encoding weights.
+
+## Setup
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Run the local tests:
+
+```bash
+.venv/bin/python -m unittest test_ca_jax.py
+```
+
+If Wolfram is installed at `/Applications/Wolfram.app`, run the reference checks:
+
+```bash
+.venv/bin/python -m unittest test_wolfram_reference.py
+```
+
+Run everything:
+
+```bash
+.venv/bin/python -m unittest test_ca_jax.py test_wolfram_reference.py
+```
+
+## Rule Tables
+
+Wolfram rule numbers are decoded into fixed-width base-`k` digit tables:
+
+```python
+import ca_jax as ca
+
+table = ca.wolfram_rule_table(rule_number=30, colors=2, table_size=8)
+```
+
+At runtime, neighborhood codes index the table in Wolfram's descending-code order:
+
+```python
+next_state = ca.lookup_wolfram_table(table, codes)
+```
+
+For direct `code -> output` tables, use:
+
+```python
+table = ca.table_from_outputs([0, 1, 1, 0])
+```
+
+## 1D Elementary Rule
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+state = jnp.array([0, 0, 0, 1, 0, 0, 0], dtype=jnp.int32)
+history = ca.evolve(lambda x: ca.elementary_step(30, x), state, steps=4)
+```
+
+## 1D General Rule
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+colors = 3
+offsets = ca.offsets_1d(radius=1)
+weights = ca.general_weights(colors, offsets)
+table = ca.wolfram_rule_table(777, colors, ca.table_size_general(colors, offsets))
+
+state = jnp.array([0, 1, 2, 0, 1], dtype=jnp.int32)
+history = ca.evolve(lambda x: ca.step_shift_accumulate(x, table, offsets, weights), state, 8)
+```
+
+## 1D Totalistic Rule
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+colors = 3
+offsets = ca.offsets_1d(1)
+weights = ca.totalistic_weights(offsets)
+table = ca.wolfram_rule_table(777, colors, ca.table_size_totalistic(colors, offsets))
+
+state = jnp.array([0, 1, 2, 0, 1], dtype=jnp.int32)
+history = ca.evolve(lambda x: ca.step_shift_accumulate(x, table, offsets, weights), state, 8)
+```
+
+## 2D Totalistic Or Weighted Rule
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+colors = 2
+offsets = ca.moore_offsets(ndim=2, radius=1)
+weights = ca.totalistic_weights(offsets)
+kernel = ca.kernel_from_offsets(offsets, weights)
+table = ca.wolfram_rule_table(42, colors, ca.table_size_totalistic(colors, offsets))
+
+state = jnp.array(
+    [
+        [0, 1, 0],
+        [1, 1, 0],
+        [0, 0, 1],
+    ],
+    dtype=jnp.int32,
+)
+
+history = ca.evolve(lambda x: ca.step_wrapped_convolution(x, table, kernel), state, 8)
+```
+
+For an outer-totalistic-style Moore neighborhood:
+
+```python
+weights = [2, 2, 2, 2, 1, 2, 2, 2, 2]
+kernel = ca.kernel_from_offsets(ca.moore_offsets(2, 1), weights)
+table = ca.wolfram_rule_table(6152, 2, ca.table_size_weighted(2, weights))
+```
+
+## Game Of Life
+
+`ca_d2_totalistic.py` includes a small named helper:
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+import ca_d2_totalistic
+
+blinker = jnp.array(
+    [
+        [0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0],
+        [0, 0, 1, 0, 0],
+        [0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0],
+    ],
+    dtype=jnp.int32,
+)
+
+history = ca.evolve(ca_d2_totalistic.game_of_life_step_fn, blinker, 2)
+```
+
+## 3D Rules
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+colors = 2
+offsets = ca.von_neumann_offsets(ndim=3, radius=1)
+weights = ca.totalistic_weights(offsets)
+kernel = ca.kernel_from_offsets(offsets, weights)
+table = ca.wolfram_rule_table(42, colors, ca.table_size_totalistic(colors, offsets))
+
+state = jnp.zeros((16, 16, 16), dtype=jnp.int32)
+next_state = ca.step_wrapped_convolution(state, table, kernel)
+```
+
+## Reversible Second-Order Rules
+
+Second-order reversible rules wrap any local rule with:
+
+```text
+next = local_step(current) - previous mod colors
+```
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+previous = jnp.array([0, 1, 0, 0, 1, 1, 0], dtype=jnp.int32)
+current = jnp.array([1, 0, 0, 1, 0, 1, 1], dtype=jnp.int32)
+local_step = lambda x: ca.elementary_step(30, x)
+
+history = ca.reversible_second_order_evolve(local_step, previous, current, steps=12, colors=2)
+```
+
+Reverse one step with:
+
+```python
+previous_again = ca.reversible_second_order_reverse_step(current, history[2], local_step, colors=2)
+```
+
+## Block Cellular Automata
+
+Block CAs encode non-overlapping blocks as base-`k` integers, apply a block table, decode, then shift the partition phase.
+
+```python
+import jax.numpy as jnp
+import ca_jax as ca
+
+# 1D two-cell block table that swaps 01 and 10.
+swap_bits = (0, 2, 1, 3)
+state = jnp.array([0, 1, 1, 0], dtype=jnp.int32)
+
+next_state = ca.apply_block_table(state, swap_bits, colors=2, block_shape=(2,), phase=(0,))
+```
+
+For 2D Margolus-style phases:
+
+```python
+rotate_clockwise = []
+for code in range(16):
+    a, b, c, d = ca.integer_digits(code, 2, 4).tolist()
+    rotate_clockwise.append(int(c * 8 + a * 4 + d * 2 + b))
+
+state = jnp.array(
+    [
+        [0, 1, 1, 0],
+        [1, 0, 0, 1],
+        [0, 0, 1, 1],
+        [1, 1, 0, 0],
+    ],
+    dtype=jnp.int32,
+)
+
+final_state = ca.block_run(
+    rotate_clockwise,
+    state,
+    colors=2,
+    block_shape=(2, 2),
+    phases=((0, 0), (1, 1)),
+    steps=jnp.asarray(128, dtype=jnp.int32),
+)
+```
+
+`block_run` returns only the final state and accepts `steps` as a runtime JAX scalar, so different step counts do not require recompilation for the same state shape and block configuration.
+
+## Benchmarks
+
+Quick benchmark:
+
+```bash
+.venv/bin/python benchmark_ca_jax.py --mode quick
+```
+
+Full benchmark:
+
+```bash
+.venv/bin/python benchmark_ca_jax.py --mode full
+```
+
+The benchmark reports compile time separately from cached runtime and normalizes throughput as million cell-updates per second.
+
+Current CPU ballpark from the full sweep:
+
+```text
+1D shift totalistic, width 1024, radius 1: about 500M cells/s
+2D convolution, 128x128 Moore/Von Neumann: about 230M cells/s
+2D Margolus block rotate, 128x128: about 460M cells/s
+3D convolution, 32x32x32: about 180-200M cells/s
+```
+
+## Wolfram Reference Checks
+
+`test_wolfram_reference.py` compares the JAX implementation against local Wolfram `CellularAutomaton` for:
+
+- elementary rules
+- 1D general rules
+- 1D totalistic and weighted rules
+- 2D general, totalistic, and weighted rules
+- 3D general and totalistic rules
+- `"GameOfLife"`
+
+The Wolfram test helper uses:
+
+```text
+/Applications/Wolfram.app/Contents/MacOS/WolframKernel
+```
+
+and skips if that path is missing.

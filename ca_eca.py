@@ -23,7 +23,7 @@ def eca_step_fn(bitcode, init):
 #    return iterations(eca_step_fn, bitcode, init, steps)
 
 def run_eca2(bitcode, init, steps):
-    return iterations_3(partial(eca_step_fn, bitcode), init, steps)
+    return iterations_4(partial(eca_step_fn, bitcode), init, steps)
 
 
 def iterations_4(step_fn, init, steps):
@@ -109,4 +109,3 @@ def random_int_fn(width, k):
     def _random(i):
         return random.randint(np.array([0,i], dtype=np.uint32), [width], 0, k, dtype=np.int32)
     return _random
-
