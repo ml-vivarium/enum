@@ -204,7 +204,108 @@ def _bench_block_2d(shape, steps):
     }
 
 
+def _bench_many_rules_case(name, state_shape, steps, colors, neighborhood, rule_count, build_step_fn):
+    key = jax.random.PRNGKey(sum(state_shape) + steps + colors + rule_count)
+    state = jax.random.randint(key, (rule_count,) + state_shape, 0, colors, dtype=jnp.int32)
+    step_fn = build_step_fn(colors, rule_count)
+
+    def run(initial):
+        def body(carry, _):
+            nxt = step_fn(carry)
+            return nxt, None
+
+        final, _ = jax.lax.scan(body, initial, None, steps)
+        return final
+
+    jitted = jax.jit(run)
+    compile_s, _ = _time_call(jitted, state)
+    samples = []
+    for _ in range(3):
+        elapsed, _ = _time_call(jitted, state)
+        samples.append(elapsed)
+
+    best = min(samples)
+    updates = rule_count * _cells(state_shape, steps)
+    return {
+        "case": name,
+        "rules": rule_count,
+        "shape": _format_shape(state_shape),
+        "steps": steps,
+        "colors": colors,
+        "neighborhood": neighborhood,
+        "compile_ms": compile_s * 1000,
+        "best_ms": best * 1000,
+        "mcells_s": updates / best / 1_000_000,
+    }
+
+
+def _many_rules_shift_general_1d(radius):
+    offsets = ca.offsets_1d(radius)
+    weights = ca.general_weights(2, offsets)
+    table_size = ca.table_size_general(2, offsets)
+
+    def build(colors, rule_count):
+        if colors != 2:
+            raise ValueError("many-rule general 1D benchmark currently uses binary rules")
+        rules = jnp.arange(rule_count, dtype=jnp.int32)
+        tables = ca.integer_digits_array(rules, colors, table_size)
+        return lambda x: ca.step_shift_accumulate_vmap(x, tables, offsets, weights)
+
+    return build
+
+
+def _many_rules_conv_totalistic(offsets):
+    weights = [1] * len(offsets)
+    kernel = ca.kernel_from_offsets(offsets, weights)
+    table_size = ca.table_size_totalistic(2, offsets)
+
+    def build(colors, rule_count):
+        if colors != 2:
+            raise ValueError("many-rule totalistic benchmark currently uses binary rules")
+        rules = jnp.arange(rule_count, dtype=jnp.int32)
+        tables = ca.integer_digits_array(rules, colors, table_size)
+        return lambda x: ca.step_wrapped_convolution_vmap(x, tables, kernel)
+
+    return build
+
+
+def benchmark_ensemble_suite():
+    rows = []
+
+    for rule_count in [256, 1024, 4096, 16384]:
+        rows.append(
+            _bench_many_rules_case(
+                "1d_many_rules_general",
+                (1024,),
+                256,
+                2,
+                "radius=1",
+                rule_count,
+                _many_rules_shift_general_1d(1),
+            )
+        )
+
+    moore = ca.moore_offsets(2, 1)
+    for rule_count in [256, 1024, 4096]:
+        rows.append(
+            _bench_many_rules_case(
+                "2d_many_rules_totalistic_moore",
+                (64, 64),
+                128,
+                2,
+                "moore_r1_9",
+                rule_count,
+                _many_rules_conv_totalistic(moore),
+            )
+        )
+
+    return rows
+
+
 def benchmark_suite(mode):
+    if mode == "ensemble":
+        return benchmark_ensemble_suite()
+
     rows = []
 
     one_d_widths = [128, 512, 1024] if mode == "full" else [128, 1024]
@@ -317,13 +418,13 @@ def benchmark_suite(mode):
 
 
 def print_markdown(rows):
-    headers = ["case", "shape", "steps", "colors", "neighborhood", "compile_ms", "best_ms", "mcells_s"]
+    headers = ["case", "rules", "shape", "steps", "colors", "neighborhood", "compile_ms", "best_ms", "mcells_s"]
     print("| " + " | ".join(headers) + " |")
     print("| " + " | ".join(["---"] * len(headers)) + " |")
     for row in rows:
         values = []
         for header in headers:
-            value = row[header]
+            value = row.get(header, "")
             if isinstance(value, float):
                 value = f"{value:.2f}"
             values.append(str(value))
@@ -332,7 +433,7 @@ def print_markdown(rows):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["quick", "full"], default="quick")
+    parser.add_argument("--mode", choices=["quick", "full", "ensemble"], default="quick")
     args = parser.parse_args()
     print(f"JAX {jax.__version__} devices={jax.devices()}")
     print_markdown(benchmark_suite(args.mode))

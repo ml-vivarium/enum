@@ -2,7 +2,7 @@ from itertools import product
 
 import numpy as onp
 import jax.numpy as jnp
-from jax import lax
+from jax import lax, vmap
 
 
 def integer_digits(number, base, length, dtype=jnp.int32):
@@ -39,6 +39,20 @@ def lookup_wolfram_table(table, codes):
     """Lookup using Wolfram's descending code order."""
     table = jnp.asarray(table)
     return jnp.take(table, table.shape[0] - 1 - codes.astype(jnp.int32), axis=0)
+
+
+def lookup_wolfram_tables(tables, codes):
+    """Batched Wolfram lookup for one table per leading state axis."""
+    tables = jnp.asarray(tables)
+    codes = jnp.asarray(codes, dtype=jnp.int32)
+    if tables.ndim != 2:
+        raise ValueError("tables must have shape (batch, table_size)")
+    if codes.ndim < 1 or codes.shape[0] != tables.shape[0]:
+        raise ValueError("codes must have a leading batch dimension matching tables")
+
+    indices = (tables.shape[1] - 1 - codes).reshape((codes.shape[0], -1))
+    values = jnp.take_along_axis(tables, indices, axis=1)
+    return values.reshape(codes.shape)
 
 
 def dense_offsets(ndim, radius):
@@ -169,6 +183,38 @@ def step_shift_accumulate(state, table, offsets, weights):
 def step_wrapped_convolution(state, table, kernel):
     codes = encode_wrapped_convolution(state, kernel)
     return lookup_wolfram_table(table, codes)
+
+
+def step_shift_accumulate_vmap(states, tables, offsets, weights):
+    """Apply many 1D/ND rules in parallel, one table per state."""
+    return vmap(
+        lambda state, table: step_shift_accumulate(state, table, offsets, weights),
+        in_axes=(0, 0),
+    )(states, tables)
+
+
+def step_shift_accumulate_same_state_vmap(state, tables, offsets, weights):
+    """Apply many rules in parallel to the same initial state."""
+    return vmap(
+        lambda table: step_shift_accumulate(state, table, offsets, weights),
+        in_axes=0,
+    )(tables)
+
+
+def step_wrapped_convolution_vmap(states, tables, kernel):
+    """Apply many convolutional rules in parallel, one table per state."""
+    return vmap(
+        lambda state, table: step_wrapped_convolution(state, table, kernel),
+        in_axes=(0, 0),
+    )(states, tables)
+
+
+def step_wrapped_convolution_same_state_vmap(state, tables, kernel):
+    """Apply many convolutional rules in parallel to the same state."""
+    return vmap(
+        lambda table: step_wrapped_convolution(state, table, kernel),
+        in_axes=0,
+    )(tables)
 
 
 def reversible_second_order_step(previous, current, local_step_fn, colors):

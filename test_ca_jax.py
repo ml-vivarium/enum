@@ -63,6 +63,51 @@ class CellularAutomataJaxTest(unittest.TestCase):
             [0, 1, 1, 0],
         )
 
+    def test_shift_accumulate_vmap_matches_individual_rules(self):
+        offsets = ca.offsets_1d(1)
+        weights = ca.general_weights(2, offsets)
+        tables = jnp.stack(
+            [
+                ca.wolfram_rule_table(30, 2, 8),
+                ca.wolfram_rule_table(90, 2, 8),
+            ]
+        )
+        states = jnp.stack(
+            [
+                jnp.array([0, 0, 0, 1, 0, 0, 0], dtype=jnp.int32),
+                jnp.array([0, 0, 0, 1, 0, 0, 0], dtype=jnp.int32),
+            ]
+        )
+
+        batched = ca.step_shift_accumulate_vmap(states, tables, offsets, weights)
+        expected = jnp.stack(
+            [
+                ca.step_shift_accumulate(states[0], tables[0], offsets, weights),
+                ca.step_shift_accumulate(states[1], tables[1], offsets, weights),
+            ]
+        )
+        self.assert_array_equal(batched, expected.tolist())
+
+    def test_same_state_shift_accumulate_vmap_matches_individual_rules(self):
+        offsets = ca.offsets_1d(1)
+        weights = ca.general_weights(2, offsets)
+        tables = jnp.stack(
+            [
+                ca.wolfram_rule_table(30, 2, 8),
+                ca.wolfram_rule_table(90, 2, 8),
+            ]
+        )
+        state = jnp.array([0, 0, 0, 1, 0, 0, 0], dtype=jnp.int32)
+
+        batched = ca.step_shift_accumulate_same_state_vmap(state, tables, offsets, weights)
+        expected = jnp.stack(
+            [
+                ca.step_shift_accumulate(state, tables[0], offsets, weights),
+                ca.step_shift_accumulate(state, tables[1], offsets, weights),
+            ]
+        )
+        self.assert_array_equal(batched, expected.tolist())
+
     def test_2d_convolution_matches_shift_accumulate_for_moore_totalistic(self):
         offsets = ca.moore_offsets(2, 1)
         weights = ca.totalistic_weights(offsets)
@@ -105,6 +150,46 @@ class CellularAutomataJaxTest(unittest.TestCase):
             ca_d2_totalistic.totalistic_d2n9_step_fn(bitcode, state),
             [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
         )
+
+    def test_wrapped_convolution_vmap_matches_individual_rules(self):
+        offsets = ca.moore_offsets(2, 1)
+        weights = ca.totalistic_weights(offsets)
+        kernel = ca.kernel_from_offsets(offsets, weights)
+        tables = jnp.stack(
+            [
+                ca.table_from_outputs([0, 1] * 5),
+                ca.table_from_outputs([1, 0] * 5),
+            ]
+        )
+        states = jnp.stack(
+            [
+                jnp.array(
+                    [
+                        [0, 1, 0],
+                        [1, 1, 0],
+                        [0, 0, 1],
+                    ],
+                    dtype=jnp.int32,
+                ),
+                jnp.array(
+                    [
+                        [1, 0, 1],
+                        [0, 1, 1],
+                        [1, 0, 0],
+                    ],
+                    dtype=jnp.int32,
+                ),
+            ]
+        )
+
+        batched = ca.step_wrapped_convolution_vmap(states, tables, kernel)
+        expected = jnp.stack(
+            [
+                ca.step_wrapped_convolution(states[0], tables[0], kernel),
+                ca.step_wrapped_convolution(states[1], tables[1], kernel),
+            ]
+        )
+        self.assert_array_equal(batched, expected.tolist())
 
     def test_game_of_life_blinker_with_outer_totalistic_table(self):
         offsets = ca.moore_offsets(2, 1)
