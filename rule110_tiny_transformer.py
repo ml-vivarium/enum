@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import math
 import os
 import struct
@@ -8,6 +9,16 @@ import zlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def autocast_context(device, dtype_name):
+    if device != "cuda" or dtype_name == "fp32":
+        return contextlib.nullcontext()
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[dtype_name]
+    return torch.autocast(device_type="cuda", dtype=dtype)
 
 
 def rule_table_by_code(rule):
@@ -20,8 +31,7 @@ def eca_step(state, rule_table):
     center = state
     right = torch.roll(state, shifts=-1, dims=-1)
     code = left * 4 + center * 2 + right
-    table = rule_table.to(device=state.device)
-    return table[code]
+    return rule_table[code]
 
 
 def eca_history(initial_state, frames, rule_table):
@@ -47,10 +57,40 @@ def make_lm_batch(batch_size, width, frames, direction, rule_table, device):
     return x, y, loss_mask.expand(batch_size, -1)
 
 
+class LMBatchGenerator:
+    def __init__(self, width, frames, direction, rule_table, device):
+        self.width = width
+        self.frames = frames
+        self.direction = direction
+        self.rule_table = rule_table.to(device=device)
+        target_positions = torch.arange(1, frames * width, device=device)
+        self.loss_mask = target_positions >= width
+        self.device = device
+
+    def __call__(self, batch_size, device):
+        initial = torch.randint(0, 2, (batch_size, self.width), device=device)
+        history = eca_history(initial, self.frames, self.rule_table)
+        if self.direction == "reverse":
+            history = torch.flip(history, dims=(1,))
+        seq = history.reshape(batch_size, self.frames * self.width)
+        return seq[:, :-1], seq[:, 1:], self.loss_mask.expand(batch_size, -1)
+
+
 def make_transition_batch(batch_size, width, rule_table, device):
     x = torch.randint(0, 2, (batch_size, width), device=device)
     y = eca_step(x, rule_table)
     return x, y, None
+
+
+class TransitionBatchGenerator:
+    def __init__(self, width, rule_table, device):
+        self.width = width
+        self.rule_table = rule_table.to(device=device)
+
+    def __call__(self, batch_size, device):
+        x = torch.randint(0, 2, (batch_size, self.width), device=device)
+        y = eca_step(x, self.rule_table)
+        return x, y, None
 
 
 def write_rgb_png(path, pixels):
@@ -310,6 +350,27 @@ class TinyGPT(nn.Module):
             self.cell_emb = nn.Embedding(width, d_model)
             self.target_frame_emb = nn.Embedding(frames, d_model)
             self.target_cell_emb = nn.Embedding(width, d_model)
+        positions = torch.arange(context_len)
+        self.register_buffer("positions", positions, persistent=False)
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(context_len, context_len, dtype=torch.bool), diagonal=1),
+            persistent=False,
+        )
+        if position_encoding in {"grid", "both"}:
+            target_positions = positions + 1
+            self.register_buffer(
+                "frame_positions",
+                torch.div(positions, width, rounding_mode="floor"),
+                persistent=False,
+            )
+            self.register_buffer("cell_positions", positions % width, persistent=False)
+            self.register_buffer(
+                "target_frame_positions",
+                torch.div(target_positions, width, rounding_mode="floor"),
+                persistent=False,
+            )
+            self.register_buffer("target_cell_positions", target_positions % width, persistent=False)
         self.blocks = nn.ModuleList(
             [Block(d_model, n_heads, dropout) for _ in range(n_layers)]
         )
@@ -318,28 +379,16 @@ class TinyGPT(nn.Module):
 
     def forward(self, idx, targets=None, loss_mask=None):
         _, seq_len = idx.shape
-        positions = torch.arange(seq_len, device=idx.device)
+        positions = self.positions[:seq_len]
         x = self.token_emb(idx)
         if self.position_encoding in {"sequential", "both"}:
             x = x + self.pos_emb(positions)[None, :, :]
         if self.position_encoding in {"grid", "both"}:
-            frame_positions = torch.div(positions, self.width, rounding_mode="floor")
-            cell_positions = positions % self.width
-            target_positions = positions + 1
-            target_frame_positions = torch.div(
-                target_positions,
-                self.width,
-                rounding_mode="floor",
-            )
-            target_cell_positions = target_positions % self.width
-            x = x + self.frame_emb(frame_positions)[None, :, :]
-            x = x + self.cell_emb(cell_positions)[None, :, :]
-            x = x + self.target_frame_emb(target_frame_positions)[None, :, :]
-            x = x + self.target_cell_emb(target_cell_positions)[None, :, :]
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=idx.device),
-            diagonal=1,
-        )
+            x = x + self.frame_emb(self.frame_positions[:seq_len])[None, :, :]
+            x = x + self.cell_emb(self.cell_positions[:seq_len])[None, :, :]
+            x = x + self.target_frame_emb(self.target_frame_positions[:seq_len])[None, :, :]
+            x = x + self.target_cell_emb(self.target_cell_positions[:seq_len])[None, :, :]
+        causal_mask = self.causal_mask[:seq_len, :seq_len]
 
         for block in self.blocks:
             x = block(x, causal_mask)
@@ -365,11 +414,25 @@ class TinyRowMaskedGPT(nn.Module):
         super().__init__()
         self.width = width
         self.frames = frames
+        self.context_len = context_len
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.source_frame_emb = nn.Embedding(frames, d_model)
         self.source_cell_emb = nn.Embedding(width, d_model)
         self.target_frame_emb = nn.Embedding(frames, d_model)
         self.target_cell_emb = nn.Embedding(width, d_model)
+        source_positions = torch.arange(context_len)
+        target_positions = source_positions + 1
+        source_frames = torch.div(source_positions, width, rounding_mode="floor")
+        target_frames = torch.div(target_positions, width, rounding_mode="floor")
+        self.register_buffer("source_frames", source_frames, persistent=False)
+        self.register_buffer("source_cells", source_positions % width, persistent=False)
+        self.register_buffer("target_frames", target_frames, persistent=False)
+        self.register_buffer("target_cells", target_positions % width, persistent=False)
+        allow_prior_rows = source_frames[None, :] < target_frames[:, None]
+        allow_initial_row = (target_frames[:, None] == 0) & (
+            source_positions[None, :] < target_positions[:, None]
+        )
+        self.register_buffer("attn_mask", ~(allow_prior_rows | allow_initial_row), persistent=False)
         self.blocks = nn.ModuleList(
             [RowMaskedBlock(d_model, n_heads, dropout) for _ in range(n_layers)]
         )
@@ -378,13 +441,10 @@ class TinyRowMaskedGPT(nn.Module):
 
     def forward(self, idx, targets=None, loss_mask=None):
         _, seq_len = idx.shape
-        source_positions = torch.arange(seq_len, device=idx.device)
-        target_positions = source_positions + 1
-
-        source_frames = torch.div(source_positions, self.width, rounding_mode="floor")
-        source_cells = source_positions % self.width
-        target_frames = torch.div(target_positions, self.width, rounding_mode="floor")
-        target_cells = target_positions % self.width
+        source_frames = self.source_frames[:seq_len]
+        source_cells = self.source_cells[:seq_len]
+        target_frames = self.target_frames[:seq_len]
+        target_cells = self.target_cells[:seq_len]
 
         context = self.token_emb(idx)
         context = context + self.source_frame_emb(source_frames)[None, :, :]
@@ -393,12 +453,7 @@ class TinyRowMaskedGPT(nn.Module):
         query = self.target_frame_emb(target_frames)[None, :, :]
         query = query + self.target_cell_emb(target_cells)[None, :, :]
         query = query.expand(idx.shape[0], -1, -1)
-
-        allow_prior_rows = source_frames[None, :] < target_frames[:, None]
-        allow_initial_row = (target_frames[:, None] == 0) & (
-            source_positions[None, :] < target_positions[:, None]
-        )
-        attn_mask = ~(allow_prior_rows | allow_initial_row)
+        attn_mask = self.attn_mask[:seq_len, :seq_len]
 
         for block in self.blocks:
             query = block(query, context, attn_mask)
@@ -453,13 +508,14 @@ class TinyTransitionTransformer(nn.Module):
 
 
 @torch.no_grad()
-def estimate_loss(model, make_batch, batch_size, eval_batches, device):
+def estimate_loss(model, make_batch, batch_size, eval_batches, device, dtype_name):
     model.eval()
     losses = []
     accuracies = []
     for _ in range(eval_batches):
         x, y, loss_mask = make_batch(batch_size, device)
-        logits, loss = model(x, y, loss_mask)
+        with autocast_context(device, dtype_name):
+            logits, loss = model(x, y, loss_mask)
         pred = logits.argmax(dim=-1)
         losses.append(loss.item())
         correct = (pred == y).float()
@@ -477,16 +533,15 @@ def parse_rule_list(value):
 
 
 def build_experiment(args, rule, device):
-    rule_table = rule_table_by_code(rule)
+    rule_table = rule_table_by_code(rule).to(device=device)
     if args.task == "lm":
         context_len = args.width * args.frames - 1
-        make_batch = lambda batch_size, device: make_lm_batch(
-            batch_size,
-            args.width,
-            args.frames,
-            args.lm_direction,
-            rule_table,
-            device,
+        make_batch = LMBatchGenerator(
+            width=args.width,
+            frames=args.frames,
+            direction=args.lm_direction,
+            rule_table=rule_table,
+            device=device,
         )
         if args.mask_row_prefix:
             if args.position_encoding != "grid":
@@ -515,11 +570,10 @@ def build_experiment(args, rule, device):
             ).to(device)
     else:
         context_len = args.width
-        make_batch = lambda batch_size, device: make_transition_batch(
-            batch_size,
-            args.width,
-            rule_table,
-            device,
+        make_batch = TransitionBatchGenerator(
+            width=args.width,
+            rule_table=rule_table,
+            device=device,
         )
         model = TinyTransitionTransformer(
             vocab_size=2,
@@ -534,6 +588,8 @@ def build_experiment(args, rule, device):
 
 def train_experiment(args, rule, device):
     rule_table, context_len, make_batch, model = build_experiment(args, rule, device)
+    if args.compile:
+        model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     parameter_count = sum(p.numel() for p in model.parameters())
@@ -541,39 +597,56 @@ def train_experiment(args, rule, device):
     print(
         f"rule={rule} task={args.task} lm_direction={args.lm_direction} "
         f"mask_row_prefix={args.mask_row_prefix} "
-        f"device={device} parameters={parameter_count:,} context_len={context_len}",
+        f"device={device} dtype={args.dtype} compile={args.compile} "
+        f"parameters={parameter_count:,} context_len={context_len}",
         flush=True,
     )
     print(f"chance_loss={chance_loss:.4f}", flush=True)
 
     curve = []
     start = time.time()
+    train_elapsed = 0.0
+    checkpoint_end = start
     model.train()
     for step in range(1, args.steps + 1):
         x, y, loss_mask = make_batch(args.batch_size, device)
-        _, loss = model(x, y, loss_mask)
+        with autocast_context(device, args.dtype):
+            _, loss = model(x, y, loss_mask)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
+            if device == "cuda":
+                torch.cuda.synchronize()
+            before_eval = time.time()
+            train_elapsed += before_eval - checkpoint_end
             eval_loss, eval_acc = estimate_loss(
                 model,
                 make_batch,
                 args.batch_size,
                 args.eval_batches,
                 device,
+                args.dtype,
             )
+            if device == "cuda":
+                torch.cuda.synchronize()
             curve.append((step, eval_loss))
             elapsed = time.time() - start
+            checkpoint_end = time.time()
+            train_steps_per_sec = step / train_elapsed if train_elapsed > 0 else 0.0
+            train_samples_per_sec = train_steps_per_sec * args.batch_size
             print(
                 f"rule={rule} "
                 f"step={step:5d} "
                 f"train_loss={loss.item():.4f} "
                 f"eval_loss={eval_loss:.4f} "
                 f"eval_acc={eval_acc:.3f} "
-                f"elapsed={elapsed:.1f}s",
+                f"elapsed={elapsed:.1f}s "
+                f"train_elapsed={train_elapsed:.1f}s "
+                f"train_steps_per_sec={train_steps_per_sec:.2f} "
+                f"train_samples_per_sec={train_samples_per_sec:.0f}",
                 flush=True,
             )
     return rule_table, make_batch, model, curve
@@ -600,6 +673,8 @@ def main():
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
+    parser.add_argument("--compile", action="store_true")
     parser.add_argument("--eval-batches", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--reconstruction-image", default=None)
