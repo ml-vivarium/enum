@@ -12,6 +12,17 @@ For 1D rules this is implemented with shift-and-accumulate over rolled arrays. F
 
 ## Setup
 
+With `uv`:
+
+```bash
+uv python install
+uv sync
+```
+
+On Linux GPU machines, `uv sync` installs the CUDA-enabled JAX extra declared in `pyproject.toml`.
+
+With stdlib `venv`:
+
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt

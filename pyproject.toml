@@ -1,0 +1,12 @@
+[project]
+name = "enum-ca"
+version = "0.1.0"
+description = "JAX experiments for Wolfram/NKS-style cellular automata"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "jax[cuda12]>=0.4.30; platform_system == 'Linux'",
+  "jax>=0.4.30; platform_system != 'Linux'",
+]
+
+[tool.uv]
+package = false
