@@ -195,6 +195,63 @@ def render_loss_curve_png(path, curves, width=1000, height=620):
     write_rgb_png(path, pixels)
 
 
+def render_frame_accuracy_png(path, accuracies, counts, width=1000, height=620):
+    bg = (255, 255, 255)
+    axis = (38, 39, 40)
+    grid = (224, 224, 224)
+    line = (44, 112, 179)
+    point = (219, 84, 59)
+    pixels = [[bg for _ in range(width)] for _ in range(height)]
+    left = 70
+    right = 40
+    top = 35
+    bottom = 70
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+
+    valid = [(idx, acc) for idx, (acc, count) in enumerate(zip(accuracies, counts)) if count > 0]
+    if not valid:
+        write_rgb_png(path, pixels)
+        return
+    min_frame = min(idx for idx, _ in valid)
+    max_frame = max(idx for idx, _ in valid)
+    min_acc = min(acc for _, acc in valid)
+    max_acc = max(acc for _, acc in valid)
+    min_acc = max(0.0, min_acc - 0.03)
+    max_acc = min(1.0, max_acc + 0.03)
+    if max_acc <= min_acc:
+        max_acc = min(1.0, min_acc + 0.01)
+
+    for i in range(6):
+        y = top + round(plot_h * i / 5)
+        draw_line(pixels, left, y, width - right, y, grid)
+    for i in range(6):
+        x = left + round(plot_w * i / 5)
+        draw_line(pixels, x, top, x, height - bottom, grid)
+    draw_line(pixels, left, top, left, height - bottom, axis)
+    draw_line(pixels, left, height - bottom, width - right, height - bottom, axis)
+
+    def project(frame, acc):
+        denom = max(1, max_frame - min_frame)
+        x = left + round(((frame - min_frame) / denom) * plot_w)
+        y = top + round((1.0 - (acc - min_acc) / (max_acc - min_acc)) * plot_h)
+        return x, y
+
+    previous = None
+    for frame, acc in valid:
+        current = project(frame, acc)
+        if previous is not None:
+            draw_line(pixels, previous[0], previous[1], current[0], current[1], line)
+            draw_line(pixels, previous[0], previous[1] + 1, current[0], current[1] + 1, line)
+        x, y = current
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                if abs(dx) + abs(dy) <= 3 and 0 <= y + dy < height and 0 <= x + dx < width:
+                    pixels[y + dy][x + dx] = point
+        previous = current
+    write_rgb_png(path, pixels)
+
+
 def expand_grid(grid, scale, on_color, off_color):
     pixels = []
     for row in grid.tolist():
@@ -245,6 +302,39 @@ def render_attention_png(path, attention_grid, scale):
     write_rgb_png(path, pixels)
 
 
+def render_attention_overlay_png(path, history, attention_grid, scale):
+    history = history.cpu().to(torch.long)
+    attention_grid = attention_grid.cpu().float()
+    max_value = attention_grid.max().item()
+    if max_value <= 0:
+        max_value = 1.0
+
+    off = (245, 245, 242)
+    on = (24, 26, 27)
+    low = (47, 115, 255)
+    high = (235, 51, 55)
+    alpha = 0.62
+    pixels = []
+    for history_row, attention_row in zip(history.tolist(), attention_grid.tolist()):
+        expanded_row = []
+        for cell, value in zip(history_row, attention_row):
+            t = math.sqrt(max(0.0, value) / max_value)
+            tint = tuple(round(low[i] * (1.0 - t) + high[i] * t) for i in range(3))
+            base = on if cell else off
+            color = tuple(round(base[i] * (1.0 - alpha) + tint[i] * alpha) for i in range(3))
+            expanded_row.extend([color] * scale)
+        for _ in range(scale):
+            pixels.append(list(expanded_row))
+    write_rgb_png(path, pixels)
+
+
+def render_history_png(path, history, scale):
+    off = (245, 245, 242)
+    on = (24, 26, 27)
+    pixels = expand_grid(history.cpu().to(torch.long), scale, on, off)
+    write_rgb_png(path, pixels)
+
+
 def parse_attention_targets(value, width, frames):
     if not value:
         defaults = [1, frames // 4, frames // 2, frames - 1]
@@ -270,8 +360,6 @@ def parse_attention_targets(value, width, frames):
         cell = int(cell_text)
         if not (0 <= frame < frames and 0 <= cell < width):
             raise ValueError(f"attention target out of bounds: {part}")
-        if frame == 0 and cell == 0:
-            raise ValueError("target 0:0 is not predicted because it has no prior token")
         targets.append((frame, cell))
     return targets
 
@@ -724,36 +812,192 @@ def train_experiment(args, rule, device):
 
 
 @torch.no_grad()
-def write_attention_images(model, make_batch, args, device):
+def write_attention_images(model, rule_table, args, device):
     if args.task != "lm" or not args.mask_row_prefix:
         raise ValueError("attention images currently require --task lm --mask-row-prefix")
     model.eval()
-    x, y, loss_mask = make_batch(1, device)
+    initial = torch.randint(0, 2, (1, args.width), device=device)
+    true_history = eca_history(initial, args.frames, rule_table)
+    model_history = true_history
+    if args.lm_direction == "reverse":
+        model_history = torch.flip(true_history, dims=(1,))
+    seq = model_history.reshape(1, args.frames * args.width)
+    x = seq[:, :-1]
+    y = seq[:, 1:]
+    target_positions = torch.arange(1, args.frames * args.width, device=device)
+    loss_mask = (target_positions >= args.width).expand(1, -1)
     logits, _, attentions = model(x, y, loss_mask, return_attn=True)
     pred = logits.argmax(dim=-1)
-    last_layer_attention = attentions[-1][0].mean(dim=0)
+
+    if args.evolution_image is not None:
+        render_history_png(args.evolution_image, true_history[0], args.image_scale)
+        print(f"wrote_evolution_image={args.evolution_image}", flush=True)
+
     root, ext = os.path.splitext(args.attention_image)
     if not ext:
         ext = ".png"
 
     for frame, cell in parse_attention_targets(args.attention_targets, args.width, args.frames):
-        target_position = frame * args.width + cell
+        natural_frame = frame
+        model_frame = frame
+        if args.attention_order == "natural" and args.lm_direction == "reverse":
+            model_frame = args.frames - 1 - frame
+        target_position = model_frame * args.width + cell
         target_index = target_position - 1
-        attention_grid = torch.zeros(args.frames, args.width, device=device)
-        source_attention = last_layer_attention[target_index]
-        source_positions = torch.arange(source_attention.numel(), device=device)
+        if not (0 <= target_index < y.shape[1]):
+            raise ValueError(f"attention target is not predicted: {frame}:{cell}")
+
+        source_positions = torch.arange(x.shape[1], device=device)
         source_frames = torch.div(source_positions, args.width, rounding_mode="floor")
+        if args.attention_order == "natural" and args.lm_direction == "reverse":
+            source_frames = args.frames - 1 - source_frames
         source_cells = source_positions % args.width
-        attention_grid[source_frames, source_cells] = source_attention
-        path = f"{root}_f{frame:03d}_c{cell:03d}{ext}"
-        render_attention_png(path, attention_grid, args.image_scale)
-        print(
-            f"wrote_attention_image={path} "
-            f"target_frame={frame} target_cell={cell} "
-            f"true={int(y[0, target_index].item())} "
-            f"pred={int(pred[0, target_index].item())}",
-            flush=True,
-        )
+
+        layer_head_maps = []
+        if args.attention_all_heads:
+            for layer_idx, layer_attention in enumerate(attentions):
+                if args.attention_layer is not None and layer_idx != args.attention_layer:
+                    continue
+                for head_idx in range(layer_attention.shape[1]):
+                    if args.attention_head is not None and head_idx != args.attention_head:
+                        continue
+                    layer_head_maps.append(
+                        (layer_idx, head_idx, layer_attention[0, head_idx, target_index])
+                    )
+        else:
+            layer_head_maps.append((len(attentions) - 1, -1, attentions[-1][0].mean(dim=0)[target_index]))
+
+        for layer_idx, head_idx, source_attention in layer_head_maps:
+            attention_grid = torch.zeros(args.frames, args.width, device=device)
+            attention_grid[source_frames, source_cells] = source_attention
+            head_label = "avg" if head_idx < 0 else f"h{head_idx:02d}"
+            path = f"{root}_f{natural_frame:03d}_c{cell:03d}_l{layer_idx:02d}_{head_label}{ext}"
+            if args.attention_overlay:
+                render_attention_overlay_png(path, true_history[0], attention_grid, args.image_scale)
+            else:
+                render_attention_png(path, attention_grid, args.image_scale)
+            print(
+                f"wrote_attention_image={path} "
+                f"target_frame={natural_frame} target_cell={cell} "
+                f"model_frame={model_frame} layer={layer_idx} head={head_idx} "
+                f"true={int(y[0, target_index].item())} "
+                f"pred={int(pred[0, target_index].item())}",
+                flush=True,
+            )
+
+    if args.attention_average_initial_row:
+        source_positions = torch.arange(x.shape[1], device=device)
+        source_frames = torch.div(source_positions, args.width, rounding_mode="floor")
+        if args.attention_order == "natural" and args.lm_direction == "reverse":
+            source_frames = args.frames - 1 - source_frames
+        source_cells = source_positions % args.width
+
+        model_frame = 0
+        if args.attention_order == "natural" and args.lm_direction == "reverse":
+            model_frame = args.frames - 1
+        target_indices = model_frame * args.width + torch.arange(args.width, device=device) - 1
+        if (target_indices < 0).any() or (target_indices >= y.shape[1]).any():
+            raise ValueError("initial-row attention average includes an unpredicted target")
+
+        for layer_idx, layer_attention in enumerate(attentions):
+            for head_idx in range(layer_attention.shape[1]):
+                mean_source_attention = layer_attention[0, head_idx, target_indices].mean(dim=0)
+                attention_grid = torch.zeros(args.frames, args.width, device=device)
+                attention_grid[source_frames, source_cells] = mean_source_attention
+                path = f"{root}_icavg_l{layer_idx:02d}_h{head_idx:02d}{ext}"
+                if args.attention_overlay:
+                    render_attention_overlay_png(path, true_history[0], attention_grid, args.image_scale)
+                else:
+                    render_attention_png(path, attention_grid, args.image_scale)
+                acc = (pred[0, target_indices] == y[0, target_indices]).float().mean().item()
+                print(
+                    f"wrote_attention_image={path} "
+                    f"target_frame=0 target_cells=all "
+                    f"model_frame={model_frame} layer={layer_idx} head={head_idx} "
+                    f"target_acc={acc:.3f}",
+                    flush=True,
+                )
+
+
+@torch.no_grad()
+def evaluate_frame_accuracy(model, rule_table, args, device):
+    if args.task != "lm":
+        raise ValueError("frame accuracy currently requires --task lm")
+    model.eval()
+    correct_by_frame = torch.zeros(args.frames, device=device)
+    count_by_frame = torch.zeros(args.frames, device=device)
+    processed = 0
+    start = time.time()
+
+    target_positions = torch.arange(1, args.frames * args.width, device=device)
+    target_model_frames = torch.div(target_positions, args.width, rounding_mode="floor")
+    valid_targets = target_positions >= args.width
+    if args.lm_direction == "reverse":
+        target_natural_frames = args.frames - 1 - target_model_frames
+    else:
+        target_natural_frames = target_model_frames
+    target_cells = target_positions % args.width
+
+    while processed < args.frame_accuracy_samples:
+        batch_size = min(args.frame_accuracy_batch_size, args.frame_accuracy_samples - processed)
+        initial = torch.randint(0, 2, (batch_size, args.width), device=device)
+        history = eca_history(initial, args.frames, rule_table)
+        model_history = history
+        if args.lm_direction == "reverse":
+            model_history = torch.flip(history, dims=(1,))
+        seq = model_history.reshape(batch_size, args.frames * args.width)
+        x = seq[:, :-1]
+        y = seq[:, 1:]
+        loss_mask = valid_targets
+        with autocast_context(device, args.dtype):
+            logits, _ = model(x, y, loss_mask.expand(batch_size, -1))
+        pred = logits.argmax(dim=-1)
+        correct = (pred == y)
+
+        for frame in range(args.frames):
+            frame_mask = (target_natural_frames == frame) & valid_targets
+            if frame_mask.any():
+                frame_correct = correct[:, frame_mask].sum()
+                correct_by_frame[frame] += frame_correct
+                count_by_frame[frame] += batch_size * frame_mask.sum()
+        processed += batch_size
+        if processed == args.frame_accuracy_samples or processed % (args.frame_accuracy_batch_size * 10) == 0:
+            elapsed = time.time() - start
+            print(
+                f"frame_accuracy_processed={processed} "
+                f"elapsed={elapsed:.1f}s "
+                f"samples_per_sec={processed / elapsed if elapsed > 0 else 0.0:.1f}",
+                flush=True,
+            )
+
+    correct_cpu = correct_by_frame.cpu()
+    count_cpu = count_by_frame.cpu()
+    accuracies = [
+        (correct_cpu[idx] / count_cpu[idx]).item() if count_cpu[idx].item() > 0 else float("nan")
+        for idx in range(args.frames)
+    ]
+    counts = [int(count_cpu[idx].item()) for idx in range(args.frames)]
+
+    if args.frame_accuracy_csv is not None:
+        with open(args.frame_accuracy_csv, "w", encoding="utf-8") as f:
+            f.write("frame,accuracy,count\n")
+            for frame, (accuracy, count) in enumerate(zip(accuracies, counts)):
+                accuracy_text = "" if count == 0 else f"{accuracy:.8f}"
+                f.write(f"{frame},{accuracy_text},{count}\n")
+        print(f"wrote_frame_accuracy_csv={args.frame_accuracy_csv}", flush=True)
+
+    if args.frame_accuracy_image is not None:
+        render_frame_accuracy_png(args.frame_accuracy_image, accuracies, counts)
+        print(f"wrote_frame_accuracy_image={args.frame_accuracy_image}", flush=True)
+
+    valid_correct = correct_cpu[count_cpu > 0].sum().item()
+    valid_count = count_cpu[count_cpu > 0].sum().item()
+    print(
+        f"frame_accuracy_overall={valid_correct / valid_count if valid_count else 0.0:.4f} "
+        f"predicted_frames={int((count_cpu > 0).sum().item())} "
+        f"samples={args.frame_accuracy_samples}",
+        flush=True,
+    )
 
 
 def main():
@@ -785,8 +1029,19 @@ def main():
     parser.add_argument("--reconstruction-samples", type=int, default=1)
     parser.add_argument("--attention-image", default=None)
     parser.add_argument("--attention-targets", default=None)
+    parser.add_argument("--attention-all-heads", action="store_true")
+    parser.add_argument("--attention-layer", type=int, default=None)
+    parser.add_argument("--attention-head", type=int, default=None)
+    parser.add_argument("--attention-average-initial-row", action="store_true")
+    parser.add_argument("--attention-order", choices=("model", "natural"), default="model")
+    parser.add_argument("--attention-overlay", action="store_true")
+    parser.add_argument("--evolution-image", default=None)
     parser.add_argument("--checkpoint-in", default=None)
     parser.add_argument("--checkpoint-out", default=None)
+    parser.add_argument("--frame-accuracy-samples", type=int, default=0)
+    parser.add_argument("--frame-accuracy-batch-size", type=int, default=256)
+    parser.add_argument("--frame-accuracy-csv", default=None)
+    parser.add_argument("--frame-accuracy-image", default=None)
     parser.add_argument("--loss-curve-image", default=None)
     parser.add_argument("--image-scale", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -854,7 +1109,10 @@ def main():
             )
 
     if args.attention_image is not None:
-        write_attention_images(model, make_batch, args, device)
+        write_attention_images(model, rule_table, args, device)
+
+    if args.frame_accuracy_samples > 0:
+        evaluate_frame_accuracy(model, rule_table, args, device)
 
 
 if __name__ == "__main__":
