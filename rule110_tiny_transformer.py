@@ -7,8 +7,10 @@ import time
 import zlib
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 
 def autocast_context(device, dtype_name):
@@ -19,6 +21,30 @@ def autocast_context(device, dtype_name):
         "fp16": torch.float16,
     }[dtype_name]
     return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed training requires CUDA in this script")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    return rank, local_rank, world_size
+
+
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process(args):
+    return getattr(args, "rank", 0) == 0
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, DistributedDataParallel) else model
 
 
 def rule_table_by_code(rule):
@@ -665,22 +691,28 @@ class TinyTransitionTransformer(nn.Module):
 @torch.no_grad()
 def estimate_loss(model, make_batch, batch_size, eval_batches, device, dtype_name):
     model.eval()
-    losses = []
-    accuracies = []
+    loss_sum = 0.0
+    acc_sum = 0.0
+    count = 0
     for _ in range(eval_batches):
         x, y, loss_mask = make_batch(batch_size, device)
         with autocast_context(device, dtype_name):
             logits, loss = model(x, y, loss_mask)
         pred = logits.argmax(dim=-1)
-        losses.append(loss.item())
+        loss_sum += loss.item()
         correct = (pred == y).float()
         if loss_mask is not None:
             correct = correct * loss_mask
-            accuracies.append((correct.sum() / loss_mask.sum()).item())
+            acc_sum += (correct.sum() / loss_mask.sum()).item()
         else:
-            accuracies.append(correct.mean().item())
+            acc_sum += correct.mean().item()
+        count += 1
+    if is_distributed():
+        stats = torch.tensor([loss_sum, acc_sum, count], device=device, dtype=torch.float64)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        loss_sum, acc_sum, count = stats.tolist()
     model.train()
-    return sum(losses) / len(losses), sum(accuracies) / len(accuracies)
+    return loss_sum / count, acc_sum / count
 
 
 def parse_rule_list(value):
@@ -769,22 +801,31 @@ def train_experiment(args, rule, device):
     if args.checkpoint_in is not None:
         checkpoint = torch.load(args.checkpoint_in, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"loaded_checkpoint={args.checkpoint_in}", flush=True)
+        if is_main_process(args):
+            print(f"loaded_checkpoint={args.checkpoint_in}", flush=True)
     if args.compile:
         model = torch.compile(model)
+    if getattr(args, "distributed", False):
+        model = DistributedDataParallel(model, device_ids=[args.local_rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    parameter_count = sum(p.numel() for p in model.parameters())
+    parameter_count = sum(p.numel() for p in unwrap_model(model).parameters())
     chance_loss = math.log(2)
-    print(
-        f"rule={rule} task={args.task} lm_direction={args.lm_direction} "
-        f"mask_row_prefix={args.mask_row_prefix} "
-        f"device={device} dtype={args.dtype} compile={args.compile} "
-        f"parameters={parameter_count:,} context_len={context_len}",
-        flush=True,
-    )
-    print(f"chance_loss={chance_loss:.4f}", flush=True)
+    if is_main_process(args):
+        print(
+            f"rule={rule} task={args.task} lm_direction={args.lm_direction} "
+            f"mask_row_prefix={args.mask_row_prefix} "
+            f"device={device} dtype={args.dtype} compile={args.compile} "
+            f"distributed={getattr(args, 'distributed', False)} "
+            f"rank={getattr(args, 'rank', 0)} world_size={getattr(args, 'world_size', 1)} "
+            f"per_gpu_batch_size={args.batch_size} "
+            f"global_batch_size={args.batch_size * getattr(args, 'world_size', 1)} "
+            f"parameters={parameter_count:,} context_len={context_len}",
+            flush=True,
+        )
+        print(f"chance_loss={chance_loss:.4f}", flush=True)
 
+    torch.manual_seed(args.seed + getattr(args, "rank", 0) * 1_000_003)
     curve = []
     best_eval_loss = None
     best_eval_acc = None
@@ -822,10 +863,10 @@ def train_experiment(args, rule, device):
                 best_eval_loss = eval_loss
                 best_eval_acc = eval_acc
                 best_step = step
-                if args.best_checkpoint_out is not None:
+                if args.best_checkpoint_out is not None and is_main_process(args):
                     save_training_checkpoint(
                         args.best_checkpoint_out,
-                        model,
+                        unwrap_model(model),
                         args,
                         rule,
                         curve,
@@ -842,33 +883,35 @@ def train_experiment(args, rule, device):
                     args.checkpoint_dir,
                     f"rule{rule:03d}_step{step:06d}.pt",
                 )
-                save_training_checkpoint(
-                    checkpoint_path,
-                    model,
-                    args,
-                    rule,
-                    curve,
-                    step,
-                    eval_loss,
-                    eval_acc,
-                )
+                if is_main_process(args):
+                    save_training_checkpoint(
+                        checkpoint_path,
+                        unwrap_model(model),
+                        args,
+                        rule,
+                        curve,
+                        step,
+                        eval_loss,
+                        eval_acc,
+                    )
             elapsed = time.time() - start
             checkpoint_end = time.time()
             train_steps_per_sec = step / train_elapsed if train_elapsed > 0 else 0.0
-            train_samples_per_sec = train_steps_per_sec * args.batch_size
-            print(
-                f"rule={rule} "
-                f"step={step:5d} "
-                f"train_loss={loss.item():.4f} "
-                f"eval_loss={eval_loss:.4f} "
-                f"eval_acc={eval_acc:.3f} "
-                f"elapsed={elapsed:.1f}s "
-                f"train_elapsed={train_elapsed:.1f}s "
-                f"train_steps_per_sec={train_steps_per_sec:.2f} "
-                f"train_samples_per_sec={train_samples_per_sec:.0f}",
-                flush=True,
-            )
-    if best_eval_loss is not None:
+            train_samples_per_sec = train_steps_per_sec * args.batch_size * getattr(args, "world_size", 1)
+            if is_main_process(args):
+                print(
+                    f"rule={rule} "
+                    f"step={step:5d} "
+                    f"train_loss={loss.item():.4f} "
+                    f"eval_loss={eval_loss:.4f} "
+                    f"eval_acc={eval_acc:.3f} "
+                    f"elapsed={elapsed:.1f}s "
+                    f"train_elapsed={train_elapsed:.1f}s "
+                    f"train_steps_per_sec={train_steps_per_sec:.2f} "
+                    f"train_samples_per_sec={train_samples_per_sec:.0f}",
+                    flush=True,
+                )
+    if best_eval_loss is not None and is_main_process(args):
         print(
             f"best_checkpoint_metric=eval_loss "
             f"best_step={best_step} "
@@ -876,7 +919,9 @@ def train_experiment(args, rule, device):
             f"best_eval_acc={best_eval_acc:.3f}",
             flush=True,
         )
-    return rule_table, make_batch, model, curve
+    if is_distributed():
+        dist.barrier()
+    return rule_table, make_batch, unwrap_model(model), curve
 
 
 @torch.no_grad()
@@ -1118,8 +1163,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    args.rank, args.local_rank, args.world_size = setup_distributed()
+    args.distributed = args.world_size > 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.compare_rules is not None:
+        if args.distributed:
+            raise ValueError("--compare-rules is not supported with torchrun/DDP")
         curves = {}
         for rule in parse_rule_list(args.compare_rules):
             torch.manual_seed(args.seed)
@@ -1132,6 +1181,10 @@ def main():
 
     torch.manual_seed(args.seed)
     rule_table, make_batch, model, curve = train_experiment(args, args.rule, device)
+    if not is_main_process(args):
+        if is_distributed():
+            dist.destroy_process_group()
+        return
     if args.checkpoint_out is not None:
         final_step = curve[-1][0] if curve else 0
         final_eval_loss = curve[-1][1] if curve else None
@@ -1186,6 +1239,9 @@ def main():
 
     if args.frame_accuracy_samples > 0:
         evaluate_frame_accuracy(model, rule_table, args, device)
+
+    if is_distributed():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
