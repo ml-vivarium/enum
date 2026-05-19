@@ -935,7 +935,7 @@ def row_consistency_loss_from_logits(logits, targets, args, rule_table):
     if args.task != "lm" or args.lm_direction != "reverse" or not args.mask_row_prefix:
         return logits.new_tensor(0.0)
     batch_size = logits.shape[0]
-    probabilities = logits.softmax(dim=-1)[..., 1]
+    probabilities = logits.float().softmax(dim=-1)[..., 1]
     predicted_history = torch.zeros(
         batch_size,
         args.frames,
@@ -1089,8 +1089,8 @@ def train_experiment(args, rule, device):
         x, y, loss_mask = make_batch(args.batch_size, device)
         with autocast_context(device, args.dtype):
             logits, loss = model(x, y, loss_mask)
-            consistency_loss = row_consistency_loss_from_logits(logits, y, args, rule_table)
-            loss = loss + args.consistency_loss_weight * consistency_loss
+        consistency_loss = row_consistency_loss_from_logits(logits, y, args, rule_table)
+        loss = loss + args.consistency_loss_weight * consistency_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
