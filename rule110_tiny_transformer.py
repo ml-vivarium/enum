@@ -741,6 +741,29 @@ def build_experiment(args, rule, device):
     return rule_table, context_len, make_batch, model
 
 
+def save_training_checkpoint(path, model, args, rule, curve, step, eval_loss=None, eval_acc=None):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "args": vars(args),
+            "rule": rule,
+            "curve": curve,
+            "step": step,
+            "eval_loss": eval_loss,
+            "eval_acc": eval_acc,
+        },
+        path,
+    )
+    print(
+        f"wrote_checkpoint={path} "
+        f"step={step} "
+        f"eval_loss={eval_loss if eval_loss is not None else float('nan'):.4f} "
+        f"eval_acc={eval_acc if eval_acc is not None else float('nan'):.3f}",
+        flush=True,
+    )
+
+
 def train_experiment(args, rule, device):
     rule_table, context_len, make_batch, model = build_experiment(args, rule, device)
     if args.checkpoint_in is not None:
@@ -763,6 +786,9 @@ def train_experiment(args, rule, device):
     print(f"chance_loss={chance_loss:.4f}", flush=True)
 
     curve = []
+    best_eval_loss = None
+    best_eval_acc = None
+    best_step = 0
     start = time.time()
     train_elapsed = 0.0
     checkpoint_end = start
@@ -792,6 +818,40 @@ def train_experiment(args, rule, device):
             if device == "cuda":
                 torch.cuda.synchronize()
             curve.append((step, eval_loss))
+            if best_eval_loss is None or eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                best_eval_acc = eval_acc
+                best_step = step
+                if args.best_checkpoint_out is not None:
+                    save_training_checkpoint(
+                        args.best_checkpoint_out,
+                        model,
+                        args,
+                        rule,
+                        curve,
+                        step,
+                        eval_loss,
+                        eval_acc,
+                    )
+            if (
+                args.checkpoint_every > 0
+                and args.checkpoint_dir is not None
+                and (step % args.checkpoint_every == 0 or step == args.steps)
+            ):
+                checkpoint_path = os.path.join(
+                    args.checkpoint_dir,
+                    f"rule{rule:03d}_step{step:06d}.pt",
+                )
+                save_training_checkpoint(
+                    checkpoint_path,
+                    model,
+                    args,
+                    rule,
+                    curve,
+                    step,
+                    eval_loss,
+                    eval_acc,
+                )
             elapsed = time.time() - start
             checkpoint_end = time.time()
             train_steps_per_sec = step / train_elapsed if train_elapsed > 0 else 0.0
@@ -808,6 +868,14 @@ def train_experiment(args, rule, device):
                 f"train_samples_per_sec={train_samples_per_sec:.0f}",
                 flush=True,
             )
+    if best_eval_loss is not None:
+        print(
+            f"best_checkpoint_metric=eval_loss "
+            f"best_step={best_step} "
+            f"best_eval_loss={best_eval_loss:.4f} "
+            f"best_eval_acc={best_eval_acc:.3f}",
+            flush=True,
+        )
     return rule_table, make_batch, model, curve
 
 
@@ -1038,6 +1106,9 @@ def main():
     parser.add_argument("--evolution-image", default=None)
     parser.add_argument("--checkpoint-in", default=None)
     parser.add_argument("--checkpoint-out", default=None)
+    parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--checkpoint-dir", default=None)
+    parser.add_argument("--best-checkpoint-out", default=None)
     parser.add_argument("--frame-accuracy-samples", type=int, default=0)
     parser.add_argument("--frame-accuracy-batch-size", type=int, default=256)
     parser.add_argument("--frame-accuracy-csv", default=None)
@@ -1062,16 +1133,18 @@ def main():
     torch.manual_seed(args.seed)
     rule_table, make_batch, model, curve = train_experiment(args, args.rule, device)
     if args.checkpoint_out is not None:
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "args": vars(args),
-                "rule": args.rule,
-                "curve": curve,
-            },
+        final_step = curve[-1][0] if curve else 0
+        final_eval_loss = curve[-1][1] if curve else None
+        save_training_checkpoint(
             args.checkpoint_out,
+            model,
+            args,
+            args.rule,
+            curve,
+            final_step,
+            final_eval_loss,
+            None,
         )
-        print(f"wrote_checkpoint={args.checkpoint_out}", flush=True)
     if args.loss_curve_image is not None:
         render_loss_curve_png(args.loss_curve_image, {args.rule: curve})
         print(f"wrote_loss_curve_image={args.loss_curve_image}", flush=True)
