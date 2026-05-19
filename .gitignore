@@ -1,3 +1,11 @@
 .venv/
 __pycache__/
 *.py[cod]
+
+# Generated experiment artifacts. Keep durable summaries in markdown instead.
+outputs/
+logs/
+*.pt
+*.png
+*.csv
+*.log
