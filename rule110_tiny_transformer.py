@@ -225,6 +225,57 @@ def render_reconstruction_png(path, true_history, reconstructed_history, scale):
     write_rgb_png(path, pixels)
 
 
+def render_attention_png(path, attention_grid, scale):
+    attention_grid = attention_grid.cpu().float()
+    max_value = attention_grid.max().item()
+    if max_value <= 0:
+        max_value = 1.0
+
+    pixels = []
+    for row in attention_grid.tolist():
+        expanded_row = []
+        for value in row:
+            intensity = math.sqrt(max(0.0, value) / max_value)
+            red = round(255 - 28 * intensity)
+            green = round(255 - 175 * intensity)
+            blue = round(255 - 210 * intensity)
+            expanded_row.extend([(red, green, blue)] * scale)
+        for _ in range(scale):
+            pixels.append(list(expanded_row))
+    write_rgb_png(path, pixels)
+
+
+def parse_attention_targets(value, width, frames):
+    if not value:
+        defaults = [1, frames // 4, frames // 2, frames - 1]
+        seen = set()
+        targets = []
+        for frame in defaults:
+            frame = max(1, min(frames - 1, frame))
+            target = (frame, width // 2)
+            if target not in seen:
+                targets.append(target)
+                seen.add(target)
+        return targets
+
+    targets = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError("--attention-targets entries must be frame:cell")
+        frame_text, cell_text = part.split(":", 1)
+        frame = int(frame_text)
+        cell = int(cell_text)
+        if not (0 <= frame < frames and 0 <= cell < width):
+            raise ValueError(f"attention target out of bounds: {part}")
+        if frame == 0 and cell == 0:
+            raise ValueError("target 0:0 is not predicted because it has no prior token")
+        targets.append((frame, cell))
+    return targets
+
+
 @torch.no_grad()
 def reconstruct_reverse(model, history, device):
     """Generate a reversed history from the final row, then return forward-time rows."""
@@ -311,12 +362,21 @@ class RowMaskedBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, query, context, attn_mask):
+    def forward(self, query, context, attn_mask, return_attn=False):
         hq = self.lnq(query)
         hkv = self.lnkv(context)
-        attn_out, _ = self.attn(hq, hkv, hkv, attn_mask=attn_mask, need_weights=False)
+        attn_out, attn_weights = self.attn(
+            hq,
+            hkv,
+            hkv,
+            attn_mask=attn_mask,
+            need_weights=return_attn,
+            average_attn_weights=False,
+        )
         query = query + attn_out
         query = query + self.mlp(self.ln2(query))
+        if return_attn:
+            return query, attn_weights
         return query
 
 
@@ -377,7 +437,7 @@ class TinyGPT(nn.Module):
         self.ln = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, idx, targets=None, loss_mask=None):
+    def forward(self, idx, targets=None, loss_mask=None, return_attn=False):
         _, seq_len = idx.shape
         positions = self.positions[:seq_len]
         x = self.token_emb(idx)
@@ -439,7 +499,7 @@ class TinyRowMaskedGPT(nn.Module):
         self.ln = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, idx, targets=None, loss_mask=None):
+    def forward(self, idx, targets=None, loss_mask=None, return_attn=False):
         _, seq_len = idx.shape
         source_frames = self.source_frames[:seq_len]
         source_cells = self.source_cells[:seq_len]
@@ -455,8 +515,13 @@ class TinyRowMaskedGPT(nn.Module):
         query = query.expand(idx.shape[0], -1, -1)
         attn_mask = self.attn_mask[:seq_len, :seq_len]
 
+        attentions = []
         for block in self.blocks:
-            query = block(query, context, attn_mask)
+            if return_attn:
+                query, attn_weights = block(query, context, attn_mask, return_attn=True)
+                attentions.append(attn_weights)
+            else:
+                query = block(query, context, attn_mask)
 
         logits = self.head(self.ln(query))
         loss = None
@@ -471,6 +536,8 @@ class TinyRowMaskedGPT(nn.Module):
                 loss = (token_loss * loss_mask).sum() / loss_mask.sum()
             else:
                 loss = token_loss.mean()
+        if return_attn:
+            return logits, loss, attentions
         return logits, loss
 
 
@@ -588,6 +655,10 @@ def build_experiment(args, rule, device):
 
 def train_experiment(args, rule, device):
     rule_table, context_len, make_batch, model = build_experiment(args, rule, device)
+    if args.checkpoint_in is not None:
+        checkpoint = torch.load(args.checkpoint_in, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(f"loaded_checkpoint={args.checkpoint_in}", flush=True)
     if args.compile:
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -652,6 +723,39 @@ def train_experiment(args, rule, device):
     return rule_table, make_batch, model, curve
 
 
+@torch.no_grad()
+def write_attention_images(model, make_batch, args, device):
+    if args.task != "lm" or not args.mask_row_prefix:
+        raise ValueError("attention images currently require --task lm --mask-row-prefix")
+    model.eval()
+    x, y, loss_mask = make_batch(1, device)
+    logits, _, attentions = model(x, y, loss_mask, return_attn=True)
+    pred = logits.argmax(dim=-1)
+    last_layer_attention = attentions[-1][0].mean(dim=0)
+    root, ext = os.path.splitext(args.attention_image)
+    if not ext:
+        ext = ".png"
+
+    for frame, cell in parse_attention_targets(args.attention_targets, args.width, args.frames):
+        target_position = frame * args.width + cell
+        target_index = target_position - 1
+        attention_grid = torch.zeros(args.frames, args.width, device=device)
+        source_attention = last_layer_attention[target_index]
+        source_positions = torch.arange(source_attention.numel(), device=device)
+        source_frames = torch.div(source_positions, args.width, rounding_mode="floor")
+        source_cells = source_positions % args.width
+        attention_grid[source_frames, source_cells] = source_attention
+        path = f"{root}_f{frame:03d}_c{cell:03d}{ext}"
+        render_attention_png(path, attention_grid, args.image_scale)
+        print(
+            f"wrote_attention_image={path} "
+            f"target_frame={frame} target_cell={cell} "
+            f"true={int(y[0, target_index].item())} "
+            f"pred={int(pred[0, target_index].item())}",
+            flush=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=("lm", "transition"), default="lm")
@@ -679,6 +783,10 @@ def main():
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--reconstruction-image", default=None)
     parser.add_argument("--reconstruction-samples", type=int, default=1)
+    parser.add_argument("--attention-image", default=None)
+    parser.add_argument("--attention-targets", default=None)
+    parser.add_argument("--checkpoint-in", default=None)
+    parser.add_argument("--checkpoint-out", default=None)
     parser.add_argument("--loss-curve-image", default=None)
     parser.add_argument("--image-scale", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -698,6 +806,17 @@ def main():
 
     torch.manual_seed(args.seed)
     rule_table, make_batch, model, curve = train_experiment(args, args.rule, device)
+    if args.checkpoint_out is not None:
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "args": vars(args),
+                "rule": args.rule,
+                "curve": curve,
+            },
+            args.checkpoint_out,
+        )
+        print(f"wrote_checkpoint={args.checkpoint_out}", flush=True)
     if args.loss_curve_image is not None:
         render_loss_curve_png(args.loss_curve_image, {args.rule: curve})
         print(f"wrote_loss_curve_image={args.loss_curve_image}", flush=True)
@@ -733,6 +852,9 @@ def main():
                 f"sample_exact_frame_rate={exact_frames:.3f}",
                 flush=True,
             )
+
+    if args.attention_image is not None:
+        write_attention_images(model, make_batch, args, device)
 
 
 if __name__ == "__main__":
