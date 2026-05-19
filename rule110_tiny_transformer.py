@@ -278,6 +278,76 @@ def render_frame_accuracy_png(path, accuracies, counts, width=1000, height=620):
     write_rgb_png(path, pixels)
 
 
+def render_frame_metric_comparison_png(path, panels, width=1600, height=620):
+    bg = (255, 255, 255)
+    axis = (38, 39, 40)
+    grid = (224, 224, 224)
+    line_colors = [(44, 112, 179), (219, 84, 59)]
+    point = (38, 39, 40)
+    pixels = [[bg for _ in range(width)] for _ in range(height)]
+    panel_gap = 60
+    panel_width = (width - panel_gap) // 2
+
+    valid_values = [
+        acc
+        for accuracies, counts in panels
+        for acc, count in zip(accuracies, counts)
+        if count > 0
+    ]
+    if not valid_values:
+        write_rgb_png(path, pixels)
+        return
+    min_acc = max(0.0, min(valid_values) - 0.03)
+    max_acc = min(1.0, max(valid_values) + 0.03)
+    if max_acc <= min_acc:
+        max_acc = min(1.0, min_acc + 0.01)
+
+    for panel_idx, (accuracies, counts) in enumerate(panels):
+        x_offset = panel_idx * (panel_width + panel_gap)
+        left = x_offset + 70
+        right = x_offset + panel_width - 40
+        top = 35
+        bottom = height - 70
+        plot_w = right - left
+        plot_h = bottom - top
+        valid = [(idx, acc) for idx, (acc, count) in enumerate(zip(accuracies, counts)) if count > 0]
+        if not valid:
+            continue
+        min_frame = min(idx for idx, _ in valid)
+        max_frame = max(idx for idx, _ in valid)
+
+        for i in range(6):
+            y = top + round(plot_h * i / 5)
+            draw_line(pixels, left, y, right, y, grid)
+        for i in range(6):
+            x = left + round(plot_w * i / 5)
+            draw_line(pixels, x, top, x, bottom, grid)
+        draw_line(pixels, left, top, left, bottom, axis)
+        draw_line(pixels, left, bottom, right, bottom, axis)
+
+        def project(frame, acc):
+            denom = max(1, max_frame - min_frame)
+            x = left + round(((frame - min_frame) / denom) * plot_w)
+            y = top + round((1.0 - (acc - min_acc) / (max_acc - min_acc)) * plot_h)
+            return x, y
+
+        previous = None
+        line = line_colors[panel_idx % len(line_colors)]
+        for frame, acc in valid:
+            current = project(frame, acc)
+            if previous is not None:
+                draw_line(pixels, previous[0], previous[1], current[0], current[1], line)
+                draw_line(pixels, previous[0], previous[1] + 1, current[0], current[1] + 1, line)
+            x, y = current
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    if abs(dx) + abs(dy) <= 3 and 0 <= y + dy < height and 0 <= x + dx < width:
+                        pixels[y + dy][x + dx] = point
+            previous = current
+
+    write_rgb_png(path, pixels)
+
+
 def expand_grid(grid, scale, on_color, off_color):
     pixels = []
     for row in grid.tolist():
@@ -1111,6 +1181,120 @@ def evaluate_frame_accuracy(model, rule_table, args, device):
         f"samples={args.frame_accuracy_samples}",
         flush=True,
     )
+    return accuracies, counts
+
+
+@torch.no_grad()
+def evaluate_transition_consistency(model, rule_table, args, device):
+    if args.task != "lm" or args.lm_direction != "reverse":
+        raise ValueError("transition consistency currently requires --task lm --lm-direction reverse")
+    model.eval()
+    correct_by_frame = torch.zeros(args.frames, device=device)
+    count_by_frame = torch.zeros(args.frames, device=device)
+    exact_by_frame = torch.zeros(args.frames, device=device)
+    exact_count_by_frame = torch.zeros(args.frames, device=device)
+    processed = 0
+    start = time.time()
+
+    target_positions = torch.arange(1, args.frames * args.width, device=device)
+    target_model_frames = torch.div(target_positions, args.width, rounding_mode="floor")
+    valid_targets = target_positions >= args.width
+    target_natural_frames = args.frames - 1 - target_model_frames
+    target_cells = target_positions % args.width
+    valid_indices = torch.nonzero(valid_targets, as_tuple=False).flatten()
+
+    while processed < args.transition_consistency_samples:
+        batch_size = min(
+            args.transition_consistency_batch_size,
+            args.transition_consistency_samples - processed,
+        )
+        initial = torch.randint(0, 2, (batch_size, args.width), device=device)
+        history = eca_history(initial, args.frames, rule_table)
+        model_history = torch.flip(history, dims=(1,))
+        seq = model_history.reshape(batch_size, args.frames * args.width)
+        x = seq[:, :-1]
+        y = seq[:, 1:]
+        with autocast_context(device, args.dtype):
+            logits, _ = model(x, y, valid_targets.expand(batch_size, -1))
+        pred = logits.argmax(dim=-1)
+
+        predicted_rows = torch.zeros(
+            batch_size,
+            args.frames,
+            args.width,
+            dtype=torch.long,
+            device=device,
+        )
+        for idx in valid_indices.tolist():
+            frame = int(target_natural_frames[idx].item())
+            cell = int(target_cells[idx].item())
+            predicted_rows[:, frame, cell] = pred[:, idx]
+
+        for frame in range(args.frames - 1):
+            produced_next = eca_step(predicted_rows[:, frame], rule_table)
+            correct = produced_next == history[:, frame + 1]
+            correct_by_frame[frame] += correct.sum()
+            count_by_frame[frame] += correct.numel()
+            exact_by_frame[frame] += correct.all(dim=-1).sum()
+            exact_count_by_frame[frame] += batch_size
+
+        processed += batch_size
+        if (
+            processed == args.transition_consistency_samples
+            or processed % (args.transition_consistency_batch_size * 10) == 0
+        ):
+            elapsed = time.time() - start
+            print(
+                f"transition_consistency_processed={processed} "
+                f"elapsed={elapsed:.1f}s "
+                f"samples_per_sec={processed / elapsed if elapsed > 0 else 0.0:.1f}",
+                flush=True,
+            )
+
+    correct_cpu = correct_by_frame.cpu()
+    count_cpu = count_by_frame.cpu()
+    exact_cpu = exact_by_frame.cpu()
+    exact_count_cpu = exact_count_by_frame.cpu()
+    accuracies = [
+        (correct_cpu[idx] / count_cpu[idx]).item() if count_cpu[idx].item() > 0 else float("nan")
+        for idx in range(args.frames)
+    ]
+    exact_rates = [
+        (exact_cpu[idx] / exact_count_cpu[idx]).item()
+        if exact_count_cpu[idx].item() > 0
+        else float("nan")
+        for idx in range(args.frames)
+    ]
+    counts = [int(count_cpu[idx].item()) for idx in range(args.frames)]
+    exact_counts = [int(exact_count_cpu[idx].item()) for idx in range(args.frames)]
+
+    if args.transition_consistency_csv is not None:
+        with open(args.transition_consistency_csv, "w", encoding="utf-8") as f:
+            f.write("frame,next_cell_accuracy,next_cell_count,next_row_exact_rate,next_row_count\n")
+            for frame, (accuracy, count, exact_rate, exact_count) in enumerate(
+                zip(accuracies, counts, exact_rates, exact_counts)
+            ):
+                accuracy_text = "" if count == 0 else f"{accuracy:.8f}"
+                exact_text = "" if exact_count == 0 else f"{exact_rate:.8f}"
+                f.write(f"{frame},{accuracy_text},{count},{exact_text},{exact_count}\n")
+        print(f"wrote_transition_consistency_csv={args.transition_consistency_csv}", flush=True)
+
+    if args.transition_consistency_image is not None:
+        render_frame_accuracy_png(args.transition_consistency_image, accuracies, counts)
+        print(f"wrote_transition_consistency_image={args.transition_consistency_image}", flush=True)
+
+    valid_correct = correct_cpu[count_cpu > 0].sum().item()
+    valid_count = count_cpu[count_cpu > 0].sum().item()
+    valid_exact = exact_cpu[exact_count_cpu > 0].sum().item()
+    valid_exact_count = exact_count_cpu[exact_count_cpu > 0].sum().item()
+    print(
+        f"transition_consistency_overall_cell={valid_correct / valid_count if valid_count else 0.0:.4f} "
+        f"transition_consistency_overall_row_exact={valid_exact / valid_exact_count if valid_exact_count else 0.0:.4f} "
+        f"predicted_source_frames={int((count_cpu > 0).sum().item())} "
+        f"samples={args.transition_consistency_samples}",
+        flush=True,
+    )
+    return accuracies, counts, exact_rates, exact_counts
 
 
 def main():
@@ -1158,6 +1342,11 @@ def main():
     parser.add_argument("--frame-accuracy-batch-size", type=int, default=256)
     parser.add_argument("--frame-accuracy-csv", default=None)
     parser.add_argument("--frame-accuracy-image", default=None)
+    parser.add_argument("--transition-consistency-samples", type=int, default=0)
+    parser.add_argument("--transition-consistency-batch-size", type=int, default=256)
+    parser.add_argument("--transition-consistency-csv", default=None)
+    parser.add_argument("--transition-consistency-image", default=None)
+    parser.add_argument("--frame-metrics-comparison-image", default=None)
     parser.add_argument("--loss-curve-image", default=None)
     parser.add_argument("--image-scale", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -1237,8 +1426,25 @@ def main():
     if args.attention_image is not None:
         write_attention_images(model, rule_table, args, device)
 
+    frame_accuracy_result = None
+    transition_consistency_result = None
     if args.frame_accuracy_samples > 0:
-        evaluate_frame_accuracy(model, rule_table, args, device)
+        frame_accuracy_result = evaluate_frame_accuracy(model, rule_table, args, device)
+    if args.transition_consistency_samples > 0:
+        transition_consistency_result = evaluate_transition_consistency(model, rule_table, args, device)
+    if (
+        args.frame_metrics_comparison_image is not None
+        and frame_accuracy_result is not None
+        and transition_consistency_result is not None
+    ):
+        render_frame_metric_comparison_png(
+            args.frame_metrics_comparison_image,
+            [
+                frame_accuracy_result,
+                (transition_consistency_result[0], transition_consistency_result[1]),
+            ],
+        )
+        print(f"wrote_frame_metrics_comparison_image={args.frame_metrics_comparison_image}", flush=True)
 
     if is_distributed():
         dist.destroy_process_group()
