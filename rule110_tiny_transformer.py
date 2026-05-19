@@ -475,6 +475,22 @@ def reconstruct_reverse(model, history, device):
     return torch.flip(generated_reversed, dims=(1,)).to(device)
 
 
+@torch.no_grad()
+def reconstruct_reverse_autoregressive(model, history, device, dtype_name):
+    """Autoregressively generate reverse-time tokens from only the final natural row."""
+    model.eval()
+    reversed_history = torch.flip(history, dims=(1,))
+    generated = reversed_history[:, 0].reshape(history.shape[0], history.shape[2])
+    total_tokens = history.shape[1] * history.shape[2]
+    while generated.shape[1] < total_tokens:
+        with autocast_context(device, dtype_name):
+            logits, _ = model(generated)
+        next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+    generated_reversed = generated.reshape(history.shape[0], history.shape[1], history.shape[2])
+    return torch.flip(generated_reversed, dims=(1,)).to(device)
+
+
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, dropout):
         super().__init__()
@@ -1297,6 +1313,149 @@ def evaluate_transition_consistency(model, rule_table, args, device):
     return accuracies, counts, exact_rates, exact_counts
 
 
+@torch.no_grad()
+def evaluate_autoregressive_reverse(model, rule_table, args, device):
+    if args.task != "lm" or args.lm_direction != "reverse":
+        raise ValueError("autoregressive reverse eval requires --task lm --lm-direction reverse")
+    if args.mask_row_prefix:
+        raise ValueError("autoregressive reverse eval is intended for unmasked causal LM runs")
+    model.eval()
+    correct_by_frame = torch.zeros(args.frames, device=device)
+    count_by_frame = torch.zeros(args.frames, device=device)
+    consistency_correct_by_frame = torch.zeros(args.frames, device=device)
+    consistency_count_by_frame = torch.zeros(args.frames, device=device)
+    exact_by_frame = torch.zeros(args.frames, device=device)
+    exact_count_by_frame = torch.zeros(args.frames, device=device)
+    processed = 0
+    start = time.time()
+
+    while processed < args.autoregressive_samples:
+        batch_size = min(args.autoregressive_batch_size, args.autoregressive_samples - processed)
+        initial = torch.randint(0, 2, (batch_size, args.width), device=device)
+        history = eca_history(initial, args.frames, rule_table)
+        reconstructed = reconstruct_reverse_autoregressive(model, history, device, args.dtype)
+
+        for frame in range(args.frames - 1):
+            correct = reconstructed[:, frame] == history[:, frame]
+            correct_by_frame[frame] += correct.sum()
+            count_by_frame[frame] += correct.numel()
+
+            produced_next = eca_step(reconstructed[:, frame], rule_table)
+            consistency = produced_next == history[:, frame + 1]
+            consistency_correct_by_frame[frame] += consistency.sum()
+            consistency_count_by_frame[frame] += consistency.numel()
+            exact_by_frame[frame] += consistency.all(dim=-1).sum()
+            exact_count_by_frame[frame] += batch_size
+
+        processed += batch_size
+        if processed == args.autoregressive_samples or processed % (args.autoregressive_batch_size * 5) == 0:
+            elapsed = time.time() - start
+            print(
+                f"autoregressive_processed={processed} "
+                f"elapsed={elapsed:.1f}s "
+                f"samples_per_sec={processed / elapsed if elapsed > 0 else 0.0:.1f}",
+                flush=True,
+            )
+
+    correct_cpu = correct_by_frame.cpu()
+    count_cpu = count_by_frame.cpu()
+    consistency_correct_cpu = consistency_correct_by_frame.cpu()
+    consistency_count_cpu = consistency_count_by_frame.cpu()
+    exact_cpu = exact_by_frame.cpu()
+    exact_count_cpu = exact_count_by_frame.cpu()
+    frame_accuracies = [
+        (correct_cpu[idx] / count_cpu[idx]).item() if count_cpu[idx].item() > 0 else float("nan")
+        for idx in range(args.frames)
+    ]
+    frame_counts = [int(count_cpu[idx].item()) for idx in range(args.frames)]
+    consistency_accuracies = [
+        (consistency_correct_cpu[idx] / consistency_count_cpu[idx]).item()
+        if consistency_count_cpu[idx].item() > 0
+        else float("nan")
+        for idx in range(args.frames)
+    ]
+    consistency_counts = [int(consistency_count_cpu[idx].item()) for idx in range(args.frames)]
+    exact_rates = [
+        (exact_cpu[idx] / exact_count_cpu[idx]).item()
+        if exact_count_cpu[idx].item() > 0
+        else float("nan")
+        for idx in range(args.frames)
+    ]
+    exact_counts = [int(exact_count_cpu[idx].item()) for idx in range(args.frames)]
+
+    if args.autoregressive_csv is not None:
+        with open(args.autoregressive_csv, "w", encoding="utf-8") as f:
+            f.write(
+                "frame,cell_accuracy,cell_count,"
+                "next_cell_consistency,next_cell_count,next_row_exact_rate,next_row_count\n"
+            )
+            for frame in range(args.frames):
+                cell_text = "" if frame_counts[frame] == 0 else f"{frame_accuracies[frame]:.8f}"
+                consistency_text = (
+                    ""
+                    if consistency_counts[frame] == 0
+                    else f"{consistency_accuracies[frame]:.8f}"
+                )
+                exact_text = "" if exact_counts[frame] == 0 else f"{exact_rates[frame]:.8f}"
+                f.write(
+                    f"{frame},{cell_text},{frame_counts[frame]},"
+                    f"{consistency_text},{consistency_counts[frame]},"
+                    f"{exact_text},{exact_counts[frame]}\n"
+                )
+        print(f"wrote_autoregressive_csv={args.autoregressive_csv}", flush=True)
+
+    if args.autoregressive_frame_accuracy_image is not None:
+        render_frame_accuracy_png(
+            args.autoregressive_frame_accuracy_image,
+            frame_accuracies,
+            frame_counts,
+        )
+        print(
+            f"wrote_autoregressive_frame_accuracy_image={args.autoregressive_frame_accuracy_image}",
+            flush=True,
+        )
+    if args.autoregressive_transition_image is not None:
+        render_frame_accuracy_png(
+            args.autoregressive_transition_image,
+            consistency_accuracies,
+            consistency_counts,
+        )
+        print(
+            f"wrote_autoregressive_transition_image={args.autoregressive_transition_image}",
+            flush=True,
+        )
+    if args.autoregressive_comparison_image is not None:
+        render_frame_metric_comparison_png(
+            args.autoregressive_comparison_image,
+            [
+                (frame_accuracies, frame_counts),
+                (consistency_accuracies, consistency_counts),
+            ],
+        )
+        print(
+            f"wrote_autoregressive_comparison_image={args.autoregressive_comparison_image}",
+            flush=True,
+        )
+
+    valid_correct = correct_cpu[count_cpu > 0].sum().item()
+    valid_count = count_cpu[count_cpu > 0].sum().item()
+    valid_consistency_correct = consistency_correct_cpu[consistency_count_cpu > 0].sum().item()
+    valid_consistency_count = consistency_count_cpu[consistency_count_cpu > 0].sum().item()
+    valid_exact = exact_cpu[exact_count_cpu > 0].sum().item()
+    valid_exact_count = exact_count_cpu[exact_count_cpu > 0].sum().item()
+    print(
+        f"autoregressive_overall_cell={valid_correct / valid_count if valid_count else 0.0:.4f} "
+        f"autoregressive_overall_next_cell_consistency="
+        f"{valid_consistency_correct / valid_consistency_count if valid_consistency_count else 0.0:.4f} "
+        f"autoregressive_overall_next_row_exact="
+        f"{valid_exact / valid_exact_count if valid_exact_count else 0.0:.4f} "
+        f"predicted_frames={int((count_cpu > 0).sum().item())} "
+        f"samples={args.autoregressive_samples}",
+        flush=True,
+    )
+    return frame_accuracies, frame_counts, consistency_accuracies, consistency_counts
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=("lm", "transition"), default="lm")
@@ -1347,6 +1506,12 @@ def main():
     parser.add_argument("--transition-consistency-csv", default=None)
     parser.add_argument("--transition-consistency-image", default=None)
     parser.add_argument("--frame-metrics-comparison-image", default=None)
+    parser.add_argument("--autoregressive-samples", type=int, default=0)
+    parser.add_argument("--autoregressive-batch-size", type=int, default=64)
+    parser.add_argument("--autoregressive-csv", default=None)
+    parser.add_argument("--autoregressive-frame-accuracy-image", default=None)
+    parser.add_argument("--autoregressive-transition-image", default=None)
+    parser.add_argument("--autoregressive-comparison-image", default=None)
     parser.add_argument("--loss-curve-image", default=None)
     parser.add_argument("--image-scale", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -1445,6 +1610,8 @@ def main():
             ],
         )
         print(f"wrote_frame_metrics_comparison_image={args.frame_metrics_comparison_image}", flush=True)
+    if args.autoregressive_samples > 0:
+        evaluate_autoregressive_reverse(model, rule_table, args, device)
 
     if is_distributed():
         dist.destroy_process_group()
