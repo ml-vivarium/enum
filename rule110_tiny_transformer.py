@@ -491,6 +491,82 @@ def reconstruct_reverse_autoregressive(model, history, device, dtype_name):
     return torch.flip(generated_reversed, dims=(1,)).to(device)
 
 
+def tiny_gpt_cached_step(model, token, position, caches):
+    if not isinstance(model, TinyGPT):
+        raise ValueError("cached autoregressive generation currently requires TinyGPT")
+    positions = model.positions[position : position + 1]
+    x = model.token_emb(token[:, None])
+    if model.position_encoding in {"sequential", "both"}:
+        x = x + model.pos_emb(positions)[None, :, :]
+    if model.position_encoding in {"grid", "both"}:
+        x = x + model.frame_emb(model.frame_positions[position : position + 1])[None, :, :]
+        x = x + model.cell_emb(model.cell_positions[position : position + 1])[None, :, :]
+        x = x + model.target_frame_emb(model.target_frame_positions[position : position + 1])[None, :, :]
+        x = x + model.target_cell_emb(model.target_cell_positions[position : position + 1])[None, :, :]
+
+    next_caches = []
+    for layer_idx, block in enumerate(model.blocks):
+        h = block.ln1(x)
+        projection = F.linear(h, block.attn.in_proj_weight, block.attn.in_proj_bias)
+        q, k, v = projection.chunk(3, dim=-1)
+        batch_size, _, embed_dim = q.shape
+        num_heads = block.attn.num_heads
+        head_dim = embed_dim // num_heads
+        q = q.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
+        if caches[layer_idx] is not None:
+            previous_k, previous_v = caches[layer_idx]
+            k = torch.cat([previous_k, k], dim=2)
+            v = torch.cat([previous_v, v], dim=2)
+        attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, v)
+        attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, 1, embed_dim)
+        attention_output = block.attn.out_proj(attention_output)
+        x = x + attention_output
+        x = x + block.mlp(block.ln2(x))
+        next_caches.append((k, v))
+
+    logits = model.head(model.ln(x))[:, 0]
+    return logits, next_caches
+
+
+@torch.no_grad()
+def reconstruct_reverse_autoregressive_cached(model, history, device, dtype_name):
+    """Cached autoregressive reverse generation for the unmasked causal TinyGPT."""
+    model.eval()
+    reversed_history = torch.flip(history, dims=(1,))
+    generated = reversed_history[:, 0].reshape(history.shape[0], history.shape[2])
+    total_tokens = history.shape[1] * history.shape[2]
+    caches = [None for _ in model.blocks]
+    next_position = 0
+    logits = None
+    with autocast_context(device, dtype_name):
+        while next_position < generated.shape[1]:
+            logits, caches = tiny_gpt_cached_step(
+                model,
+                generated[:, next_position],
+                next_position,
+                caches,
+            )
+            next_position += 1
+        while generated.shape[1] < total_tokens:
+            next_token = logits.argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+            if generated.shape[1] == total_tokens:
+                break
+            logits, caches = tiny_gpt_cached_step(
+                model,
+                next_token[:, 0],
+                next_position,
+                caches,
+            )
+            next_position += 1
+    generated_reversed = generated.reshape(history.shape[0], history.shape[1], history.shape[2])
+    return torch.flip(generated_reversed, dims=(1,)).to(device)
+
+
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, dropout):
         super().__init__()
@@ -1333,7 +1409,10 @@ def evaluate_autoregressive_reverse(model, rule_table, args, device):
         batch_size = min(args.autoregressive_batch_size, args.autoregressive_samples - processed)
         initial = torch.randint(0, 2, (batch_size, args.width), device=device)
         history = eca_history(initial, args.frames, rule_table)
-        reconstructed = reconstruct_reverse_autoregressive(model, history, device, args.dtype)
+        if args.autoregressive_use_cache:
+            reconstructed = reconstruct_reverse_autoregressive_cached(model, history, device, args.dtype)
+        else:
+            reconstructed = reconstruct_reverse_autoregressive(model, history, device, args.dtype)
 
         for frame in range(args.frames - 1):
             correct = reconstructed[:, frame] == history[:, frame]
@@ -1512,6 +1591,7 @@ def main():
     parser.add_argument("--autoregressive-frame-accuracy-image", default=None)
     parser.add_argument("--autoregressive-transition-image", default=None)
     parser.add_argument("--autoregressive-comparison-image", default=None)
+    parser.add_argument("--autoregressive-use-cache", action="store_true")
     parser.add_argument("--loss-curve-image", default=None)
     parser.add_argument("--image-scale", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
