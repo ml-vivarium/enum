@@ -70,6 +70,26 @@ def eca_history(initial_state, frames, rule_table):
     return torch.stack(states, dim=1)
 
 
+def soft_eca_step(probabilities, rule_table):
+    """Expected ECA next row for independent Bernoulli cell probabilities."""
+    left = torch.roll(probabilities, shifts=1, dims=-1)
+    center = probabilities
+    right = torch.roll(probabilities, shifts=-1, dims=-1)
+    expected = torch.zeros_like(probabilities)
+    for code in range(8):
+        output = float(rule_table[code].item())
+        if output == 0.0:
+            continue
+        left_bit = (code >> 2) & 1
+        center_bit = (code >> 1) & 1
+        right_bit = code & 1
+        term = left if left_bit else (1.0 - left)
+        term = term * (center if center_bit else (1.0 - center))
+        term = term * (right if right_bit else (1.0 - right))
+        expected = expected + output * term
+    return expected.clamp(1.0e-6, 1.0 - 1.0e-6)
+
+
 def make_lm_batch(batch_size, width, frames, direction, rule_table, device):
     initial = torch.randint(0, 2, (batch_size, width), device=device)
     history = eca_history(initial, frames, rule_table)
@@ -911,6 +931,41 @@ def estimate_loss(model, make_batch, batch_size, eval_batches, device, dtype_nam
     return loss_sum / count, acc_sum / count
 
 
+def row_consistency_loss_from_logits(logits, targets, args, rule_table):
+    if args.task != "lm" or args.lm_direction != "reverse" or not args.mask_row_prefix:
+        return logits.new_tensor(0.0)
+    batch_size = logits.shape[0]
+    probabilities = logits.softmax(dim=-1)[..., 1]
+    predicted_history = torch.zeros(
+        batch_size,
+        args.frames,
+        args.width,
+        dtype=probabilities.dtype,
+        device=probabilities.device,
+    )
+    true_history = torch.zeros(
+        batch_size,
+        args.frames,
+        args.width,
+        dtype=probabilities.dtype,
+        device=probabilities.device,
+    )
+    target_positions = torch.arange(1, args.frames * args.width, device=probabilities.device)
+    model_frames = torch.div(target_positions, args.width, rounding_mode="floor")
+    natural_frames = args.frames - 1 - model_frames
+    cells = target_positions % args.width
+    valid = target_positions >= args.width
+    predicted_history[:, natural_frames[valid], cells[valid]] = probabilities[:, valid]
+    true_history[:, natural_frames[valid], cells[valid]] = targets[:, valid].to(probabilities.dtype)
+
+    losses = []
+    for frame in range(args.frames - 1):
+        predicted_next = soft_eca_step(predicted_history[:, frame], rule_table)
+        true_next = true_history[:, frame + 1]
+        losses.append(F.binary_cross_entropy(predicted_next, true_next))
+    return torch.stack(losses).mean()
+
+
 def parse_rule_list(value):
     return [int(part.strip()) for part in value.split(",") if part.strip()]
 
@@ -1033,7 +1088,9 @@ def train_experiment(args, rule, device):
     for step in range(1, args.steps + 1):
         x, y, loss_mask = make_batch(args.batch_size, device)
         with autocast_context(device, args.dtype):
-            _, loss = model(x, y, loss_mask)
+            logits, loss = model(x, y, loss_mask)
+            consistency_loss = row_consistency_loss_from_logits(logits, y, args, rule_table)
+            loss = loss + args.consistency_loss_weight * consistency_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -1099,6 +1156,7 @@ def train_experiment(args, rule, device):
                     f"rule={rule} "
                     f"step={step:5d} "
                     f"train_loss={loss.item():.4f} "
+                    f"consistency_loss={consistency_loss.item():.4f} "
                     f"eval_loss={eval_loss:.4f} "
                     f"eval_acc={eval_acc:.3f} "
                     f"elapsed={elapsed:.1f}s "
@@ -1747,6 +1805,7 @@ def main():
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--consistency-loss-weight", type=float, default=0.0)
     parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--eval-batches", type=int, default=8)
