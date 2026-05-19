@@ -49,6 +49,9 @@ faab76b Add checkpoint and attention exports
 Generated plots, checkpoints, CSVs, and Slurm logs are ignored by git. Durable
 results should be copied into `log.md` or this file.
 
+For the causal-inference framing around attention maps, see
+`CAUSAL_INFERENCE_NOTES.md`.
+
 ## Main Script
 
 `rule110_tiny_transformer.py` is misnamed: it supports arbitrary elementary CA
@@ -381,6 +384,8 @@ themselves. A better test needs interventions. In this finite CA setting we can
 do exact interventions by enumerating all initial conditions at small width,
 computing exact conditional distributions, and comparing model behavior to known
 posterior structures.
+
+The expanded version of this methodology is in `CAUSAL_INFERENCE_NOTES.md`.
 
 Suggested enumeration size:
 
