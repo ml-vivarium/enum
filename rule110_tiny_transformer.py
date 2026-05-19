@@ -591,9 +591,11 @@ def predict_natural_row_autoregressive(model, history, natural_frame, device, dt
             )
             next_position += 1
         generated_row = []
-        for _ in range(history.shape[2]):
+        for cell_idx in range(history.shape[2]):
             next_token = logits.argmax(dim=-1)
             generated_row.append(next_token)
+            if cell_idx == history.shape[2] - 1:
+                break
             logits, caches = tiny_gpt_cached_step(model, next_token, next_position, caches)
             next_position += 1
     return torch.stack(generated_row, dim=1)
